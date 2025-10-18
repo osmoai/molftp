@@ -26,8 +26,8 @@ High-performance molecular feature generation based on fragment-target prevalenc
 
 ### Requirements
 
-- Python >= 3.8
-- RDKit >= 2022.3.0
+- Python >= 3.11
+- RDKit >= 2025.3.0
 - NumPy >= 1.19.0
 - C++17 compatible compiler
 

@@ -160,7 +160,7 @@ On the BBBP dataset (Blood-Brain Barrier Penetration, 2039 molecules):
 | Key-LOO | 0.9369 ± 0.0115 | **0.9513 ± 0.0085** | 50-100x |
 | Dummy-Masking | 0.9205 ± 0.0149 | 0.9110 ± 0.0165 | 50-100x |
 
-Multi-task Key-LOO achieves **state-of-the-art performance** on BBB prediction tasks.
+Multi-task Key-LOO achieves **state-of-the-art performance** on BBB prediction tasks (new paper in preparation).
 
 ## Citation
 

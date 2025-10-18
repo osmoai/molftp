@@ -1,7 +1,7 @@
 # MolFTP: Molecular Fragment-Target Prevalence
 
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.8+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![C++17](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
 
 High-performance molecular feature generation based on fragment-target prevalence statistics. MolFTP generates interpretable, statistically-grounded features for molecular property prediction with state-of-the-art performance.

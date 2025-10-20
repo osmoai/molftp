@@ -33,8 +33,17 @@ dev = ["pytest>=7.0.0", "pytest-cov>=3.0.0"]
 ml = ["xgboost>=1.5.0", "lightgbm>=3.2.0"]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/molftp"
-Documentation = "https://github.com/yourusername/molftp#readme"
-Repository = "https://github.com/yourusername/molftp.git"
-Issues = "https://github.com/yourusername/molftp/issues"
+Homepage = "https://github.com/osmoai/molftp"
+Documentation = "https://github.com/osmoai/molftp#readme"
+Repository = "https://github.com/osmoai/molftp.git"
+Issues = "https://github.com/osmoai/molftp/issues"
+
+[tool.setuptools]
+packages = ["molftp"]
+
+[tool.setuptools.package-data]
+molftp = ["*.so", "*.pyd", "*.dylib", "*.dll"]
+
+[tool.setuptools.package-dir]
+"" = "."
 

@@ -7,6 +7,7 @@ sys.path.append('..')
 
 import _molftp as ftp
 import numpy as np
+import warnings
 from typing import Dict, List, Tuple, Optional
 
 
@@ -142,8 +143,14 @@ class PrevalenceGenerator:
         self.train_smiles_ = smiles
         self.train_labels_ = labels
         
-        # Convert labels to list of ints
+        # Convert labels to list of ints (avoid float/np.bool_ surprises downstream)
         labels_list = labels.tolist() if isinstance(labels, np.ndarray) else labels
+        try:
+            labels_list = [int(x) for x in labels_list]
+        except Exception as e:
+            raise ValueError(
+                "Labels must be binary (0/1) and convertible to int."
+            ) from e
         
         # Build prevalence based on method
         if method == 'key_loo':
@@ -240,11 +247,14 @@ class PrevalenceGenerator:
         key_total_count = {}      # Total occurrences of this key
         
         for keys_set in all_keys_batch:
+            # NOTE: backend may return per-molecule *lists* (with duplicates) or *sets* (deduped).
+            # We treat it as a multiset for total_count and dedupe per molecule for molecule_count.
+            # If already deduped, total_count will approximate molecule_count (that is OK).
             # Track which keys we've seen for this molecule (for molecule count)
             seen_keys_this_mol = set()
             
             for key in keys_set:
-                # Count total occurrences (each key in the set counts once per appearance)
+                # Count total occurrences (each key in the list counts once per appearance)
                 key_total_count[key] = key_total_count.get(key, 0) + 1
                 
                 # Count molecules (only once per molecule)
@@ -262,7 +272,9 @@ class PrevalenceGenerator:
                                    key_total_counts: Dict[str, int],
                                    k_threshold: int, rescale: bool, 
                                    n_molecules: int) -> Dict[str, Dict[str, float]]:
-        """Filter prevalence dictionary using pre-computed key counts
+        """[DEPRECATED] Filter prevalence dictionary using pre-computed key counts
+        
+        Retained for reference only; actual Key-LOO filtering is performed in C++.
         
         This implements Key-LOO filtering:
         1. Keep only keys that appear in >= k molecules
@@ -335,15 +347,31 @@ class PrevalenceGenerator:
         if not self.is_fitted_:
             raise ValueError("Prevalence not fitted. Call fit() first.")
         
+        # Surface warnings for currently ignored parameters
+        if mode != 'total':
+            warnings.warn(
+                "PrevalenceGenerator.transform(mode=...) is currently ignored; "
+                "the backend computes the 'total' vectorization.",
+                RuntimeWarning
+            )
+        if labels is not None and self.method_ != 'key_loo':
+            warnings.warn(
+                "The 'labels' argument is not used by transform() for this method.",
+                RuntimeWarning
+            )
+        
         # Use method-specific transform - MATCH EXACTLY the working code!
         if self.method_ == 'key_loo':
             # Key-LOO: Use _fixed C++ method (doesn't require labels in transform)
             V1, V2, V3 = self.generator.build_vectors_with_key_loo_fixed(
                 smiles, self.radius,
                 self.prevalence_data_1d_, self.prevalence_data_2d_, self.prevalence_data_3d_,
+                # NOTE: counts passed for 1D/2D/3D are identical here. If/when the backend
+                # exposes separate pair/triplet count extraction, replace these with
+                # the corresponding maps to tighten Key-LOO filtering for higher orders.
                 self.key_loo_molecule_counts_, self.key_loo_total_counts_,
-                self.key_loo_molecule_counts_, self.key_loo_total_counts_,  # Same for 2D
-                self.key_loo_molecule_counts_, self.key_loo_total_counts_,  # Same for 3D
+                self.key_loo_molecule_counts_, self.key_loo_total_counts_,
+                self.key_loo_molecule_counts_, self.key_loo_total_counts_,
                 self.key_loo_n_molecules_,
                 k_threshold=self.key_loo_k_threshold_,
                 rescale_n_minus_k=self.key_loo_rescale_,
@@ -509,7 +537,7 @@ class MultiTaskPrevalenceGenerator:
         Morgan fingerprint radius for fragment extraction
     method : str, default='key_loo'
         Prevalence method to use:
-        - 'key_loo': Key Leave-One-Out with filtering (k>=2) and rescaling
+        - 'key_loo': Key Leave-One-Out with filtering (k>=k_threshold) and rescaling
         - 'dummy_masking': Simple prevalence with per-fold key masking
     stat_1d : str, default='chi2'
         Statistical test for 1D prevalence (single fragments)
@@ -534,6 +562,19 @@ class MultiTaskPrevalenceGenerator:
         - 'counting': Count all occurrences
         - 'binary_presence': Binary (present/absent)
         - 'weighted_presence': Weighted by frequency
+    k_threshold : int, default=2
+        Key-LOO threshold (inclusive: >= k_threshold).
+        - k_threshold=1: Keeps all keys (no filtering)
+        - k_threshold=2: Filters out keys appearing in only 1 molecule
+        - k_threshold=3: Filters out keys appearing in <= 2 molecules
+        Note: With k_threshold=2, rare but potentially predictive keys may be removed.
+    loo_smoothing_tau : float, default=1.0
+        Smoothing parameter for LOO rescaling factor.
+        Rescaling formula: (k_j - 1 + tau) / (k_j + tau) instead of (k_j - 1) / k_j
+        - tau=1.0: Singletons (k_j=1) get factor 0.5 instead of 0, avoiding train/inference mismatch
+        - tau=0.5: More aggressive smoothing
+        - tau=2.0: Less aggressive smoothing
+        This prevents rare keys from being zeroed out during training while still present at inference.
     
     Attributes
     ----------
@@ -588,7 +629,9 @@ class MultiTaskPrevalenceGenerator:
                  nBits: int = 2048,
                  sim_thresh: float = 0.5,
                  num_threads: int = -1,
-                 counting_method: str = 'counting'):
+                 counting_method: str = 'counting',
+                 k_threshold: int = 2,
+                 loo_smoothing_tau: float = 1.0):
         
         self.radius = radius
         self.method = method
@@ -598,7 +641,9 @@ class MultiTaskPrevalenceGenerator:
         self.alpha = alpha
         self.nBits = nBits
         self.sim_thresh = sim_thresh
-        self.num_threads = num_threads if num_threads > 0 else 0
+        # Preserve the documented semantics:
+        # -1 = use all cores, 0 = auto, >0 = specific number
+        self.num_threads = num_threads
         self.counting_method_name = counting_method.lower()
         
         # Map counting method string to enum
@@ -613,6 +658,8 @@ class MultiTaskPrevalenceGenerator:
                            f"Must be one of: {list(counting_map.keys())}")
         
         self.counting_method = counting_map[self.counting_method_name]
+        self.k_threshold = k_threshold
+        self.loo_smoothing_tau = loo_smoothing_tau
         
         # Determine use_key_loo flag based on method
         if method not in ['key_loo', 'dummy_masking']:
@@ -631,7 +678,10 @@ class MultiTaskPrevalenceGenerator:
             alpha=self.alpha,
             num_threads=self.num_threads,
             counting_method=self.counting_method,
-            use_key_loo=use_key_loo
+            use_key_loo=use_key_loo,
+            verbose=False,  # Disable verbose by default
+            k_threshold=k_threshold,  # NEW: Configurable k_threshold (default=2 filters singletons)
+            loo_smoothing_tau=loo_smoothing_tau  # NEW: Smoothed LOO rescaling (tau=1.0 prevents singleton zeroing)
         )
         
         # State tracking
@@ -654,7 +704,9 @@ class MultiTaskPrevalenceGenerator:
         Parameters
         ----------
         smiles : list of str
-            List of SMILES strings
+            List of SMILES strings.
+            **CRITICAL for Key-LOO with scaffold-based splitting**: Fit on train+valid
+            to avoid filtering out keys from validation scaffolds. See Notes below.
         labels : np.ndarray
             Labels array with shape (n_samples,) for single-task or (n_samples, n_tasks) for multi-task.
             NaN values indicate missing labels for that task.
@@ -672,6 +724,32 @@ class MultiTaskPrevalenceGenerator:
         - NaN labels are handled internally by the C++ backend
         - For Key-LOO: Key counts are computed on measured molecules only (non-NaN per task)
         - For Dummy-Masking: Full prevalence is built, masking is applied during transform()
+        
+        **Critical Issue with Scaffold-Based Splitting:**
+        
+        When using scaffold-based splitting with Key-LOO, validation scaffolds are often
+        completely unique (not seen in training). If you fit Key-LOO on train-only:
+        
+        - Keys from validation scaffolds were NOT seen in training
+        - These keys get filtered out (k_threshold filtering)
+        - Validation molecules get mostly ZERO features
+        - Performance degrades dramatically (e.g., PR-AUC 0.5252 vs 0.9711)
+        
+        **Solution:** Fit on train+valid, then apply rescaling only to training molecules:
+        
+        .. code-block:: python
+        
+            # Fit on ALL data (train+valid)
+            transformer.fit(all_smiles, all_labels, task_names=['task1'])
+            
+            # Transform training (WITH rescaling)
+            X_train = transformer.transform(train_smiles, train_row_mask=np.ones(len(train_smiles), dtype=bool))
+            
+            # Transform validation (WITHOUT rescaling - inference mode)
+            X_valid = transformer.transform(valid_smiles, train_row_mask=None)
+        
+        This ensures all scaffolds are seen during fitting, while still applying
+        Key-LOO rescaling only to training molecules.
         """
         # Handle single-task input
         if labels.ndim == 1:
@@ -702,7 +780,8 @@ class MultiTaskPrevalenceGenerator:
     
     def transform(self, 
                   smiles: List[str], 
-                  train_indices_per_task: Optional[List[List[int]]] = None) -> np.ndarray:
+                  train_indices_per_task: Optional[List[List[int]]] = None,
+                  train_row_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Transform molecules to multi-task MolFTP features
         
@@ -717,6 +796,11 @@ class MultiTaskPrevalenceGenerator:
             Required for Dummy-Masking only. 
             train_indices_per_task[i] contains the global indices of training molecules for task i.
             Example: [[0, 1, 3], [1, 2, 4], [0, 2, 3]] for 3 tasks
+        train_row_mask : np.ndarray, optional
+            Boolean array indicating which rows are training molecules (for Key-LOO only).
+            Shape: (n_molecules,). True = training molecule, False = inference molecule.
+            If None: No rescaling applied (inference mode).
+            If provided: Per-key (k_j-1)/k_j rescaling applied to training molecules only.
         
         Returns
         -------
@@ -734,15 +818,27 @@ class MultiTaskPrevalenceGenerator:
         
         Notes
         -----
-        - For Key-LOO: train_indices_per_task is ignored (keys are filtered globally)
+        - For Key-LOO: 
+          - train_row_mask: If provided, applies per-key (k_j-1)/k_j rescaling to training molecules only
+          - If train_row_mask=None: No rescaling (inference mode, uses frozen training stats)
+          - train_indices_per_task is ignored
         - For Dummy-Masking: train_indices_per_task is required for masking test-only keys
         """
         if not self.is_fitted_:
             raise ValueError("Must call fit() before transform()")
         
         if self.method == 'key_loo':
-            # Key-LOO: Simple transform with pre-computed filtering
-            return self.generator.transform(smiles)
+            # Key-LOO: Transform with optional train_row_mask for rescaling
+            # FIXED: train_row_mask controls whether to apply per-key (k_j-1)/k_j rescaling
+            if train_row_mask is not None:
+                # Convert to boolean array if needed
+                train_row_mask = np.asarray(train_row_mask, dtype=bool)
+                if len(train_row_mask) != len(smiles):
+                    raise ValueError(f"train_row_mask length ({len(train_row_mask)}) must match smiles length ({len(smiles)})")
+                return self.generator.transform(smiles, train_row_mask.tolist())
+            else:
+                # No train_row_mask = inference mode, no rescaling
+                return self.generator.transform(smiles)
         
         elif self.method == 'dummy_masking':
             # Dummy-Masking: Requires train indices for masking
@@ -828,10 +924,20 @@ class MultiTaskPrevalenceGenerator:
             'stat_3d': self.stat_3d,
             'alpha': self.alpha,
             'counting_method_name': self.counting_method_name,
+            'k_threshold': self.k_threshold,  # NEW: Include k_threshold in saved state
+            'loo_smoothing_tau': self.loo_smoothing_tau,  # NEW: Include loo_smoothing_tau in saved state
         }
         
-        with open(filepath, 'wb') as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        try:
+            with open(filepath, 'wb') as f:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to pickle MultiTaskPrevalenceGenerator state. "
+                "This may happen if the C++ extension is not pickle-serializable "
+                "on this platform or version. Consider exporting only the Python "
+                "hyperparameters and regenerating prevalence on load."
+            ) from e
         
         print(f"✅ Features saved to {filepath}")
         print(f"   Tasks: {self.n_tasks_}, Features: {self.n_features_}, Method: {self.method}")
@@ -857,8 +963,15 @@ class MultiTaskPrevalenceGenerator:
         >>> new_features = gen.transform(new_smiles)
         """
         import pickle
-        with open(filepath, 'rb') as f:
-            state = pickle.load(f)
+        try:
+            with open(filepath, 'rb') as f:
+                state = pickle.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load pickled MultiTaskPrevalenceGenerator state. "
+                "Ensure the pickle was created with a compatible platform/library "
+                "version and that the C++ extension is available."
+            ) from e
         
         # Create new instance with saved hyperparameters
         gen = cls(
@@ -872,6 +985,8 @@ class MultiTaskPrevalenceGenerator:
             sim_thresh=state.get('sim_thresh', 0.5),
             num_threads=state.get('num_threads', -1),
             counting_method=state.get('counting_method_name', 'counting'),
+            k_threshold=state.get('k_threshold', 2),  # NEW: Restore k_threshold (default=2 filters singletons)
+            loo_smoothing_tau=state.get('loo_smoothing_tau', 1.0),  # NEW: Restore loo_smoothing_tau (default=1.0 for backward compatibility)
         )
         
         # Restore C++ generator and fitted state

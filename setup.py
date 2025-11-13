@@ -51,41 +51,75 @@ def find_rdkit_paths():
     print("Warning: Could not auto-detect RDKit paths. Using system defaults.")
     return '', ''
 
-# Find RDKit paths
+# Conan Boost paths (hardcoded for direct use)
+conan_boost_include = '/Users/guillaume-osmo/Github/rdkit-pypi/conan/direct_deploy/boost/include'
+conan_boost_lib = '/Users/guillaume-osmo/Github/rdkit-pypi/conan/direct_deploy/boost/lib'
+
+# Find RDKit paths (respects RDKIT_INCLUDE and RDKIT_LIB environment variables)
 rdkit_include, rdkit_lib = find_rdkit_paths()
 
-# Get pybind11 include path
-pybind11_include = pybind11.get_include()
+# Fallback to conda environment if not found via find_rdkit_paths
+if not rdkit_include:
+    conda_prefix = os.environ.get('CONDA_PREFIX', '')
+    rdkit_include = os.path.join(conda_prefix, 'include')
+    rdkit_lib = os.path.join(conda_prefix, 'lib', 'python3.11', 'site-packages', 'rdkit', '.dylibs')
 
-# Define the extension
-ext_modules = [
-    Pybind11Extension(
-        "_molftp",
-        sources=["src/molftp_core.cpp"],
-        include_dirs=[
-            # RDKit headers (need both the main include and the rdkit subdirectory)
-            rdkit_include,
-            os.path.join(rdkit_include, "rdkit"),
-            # pybind11 headers
-            pybind11_include,
-            # Python headers
-            "/Users/guillaume-osmo/miniconda3/envs/rdkit_build_py311/include/python3.11",
-            # Boost headers (from Conan)
-            "/Users/guillaume-osmo/Github/rdkit-pypi/conan/direct_deploy/boost/include",
-        ],
-        libraries=["RDKitGraphMol", "RDKitSmilesParse", "RDKitRDGeneral", "RDKitFingerprints", "RDKitDataStructs", "boost_system", "boost_thread", "boost_filesystem"],
-        library_dirs=[
-            rdkit_lib,
-            "/Users/guillaume-osmo/Github/rdkit-pypi/conan/direct_deploy/boost/lib",
-        ],
-        language='c++',
-        cxx_std=17,
-    ),
+# Build include directories - prioritize Conan Boost and RDKit includes
+include_dirs = [
+    conan_boost_include,
+    rdkit_include,  # Use RDKit headers
+    os.path.join(rdkit_include, 'rdkit'),  # Add rdkit subdirectory for RDGeneral/export.h
+    pybind11.get_include(),
+    '/opt/homebrew/include', # Homebrew include
 ]
+
+# Build library directories - prioritize Conan Boost and RDKit libs
+library_dirs = [
+    conan_boost_lib,
+    rdkit_lib,  # Use RDKit libs
+    '/opt/homebrew/lib', # Homebrew lib
+    '/opt/homebrew/Cellar/libomp/21.1.5/lib',  # OpenMP library (libomp)
+]
+
+# Check if RDKit headers are available
+rdkit_headers_available = False
+if rdkit_include:
+    rdkit_headers_available = os.path.exists(os.path.join(rdkit_include, 'rdkit', 'GraphMol', 'ROMol.h'))
+
+# Define the extension only if RDKit headers are available
+ext_modules = []
+if rdkit_headers_available:
+    print("RDKit headers found. Building C++ extension.")
+    ext_modules = [
+        Pybind11Extension(
+            "_molftp",
+            sources=["src/molftp_core.cpp"],
+            include_dirs=include_dirs,
+            libraries=["RDKitGraphMol", "RDKitSmilesParse", "RDKitRDGeneral", "RDKitFingerprints", "RDKitDataStructs", "boost_system", "boost_thread", "boost_filesystem"],
+            library_dirs=library_dirs,
+            language='c++',
+            cxx_std=17,
+            extra_compile_args=[
+                '-fvisibility=hidden',
+                '-g0',
+                '-std=c++17',
+                '-mmacosx-version-min=10.14',
+                '-O3',
+                '-ffast-math',
+                '-march=native',
+                '-Xpreprocessor', '-fopenmp'  # OpenMP support (libomp installed)
+            ],
+            extra_link_args=[
+                '-lomp'  # Link OpenMP library
+            ],
+        ),
+    ]
+else:
+    print("Warning: RDKit headers not found. Building Python-only package.")
 
 setup(
     name="molftp",
-    version="1.0.0",
+    version="1.3.0",
     author="MolFTP Contributors",
     author_email="",
     description="Molecular Fragment-Target Prevalence: High-performance feature generation for molecular property prediction",
@@ -106,7 +140,7 @@ setup(
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Science/Research",
-        "License :: OSI Approved :: MIT License",
+        "License :: OSI Approved :: BSD License",
         "Programming Language :: Python :: 3",
         "Topic :: Scientific/Engineering :: Chemistry",
     ],

@@ -562,7 +562,7 @@ class MultiTaskPrevalenceGenerator:
         - 'counting': Count all occurrences
         - 'binary_presence': Binary (present/absent)
         - 'weighted_presence': Weighted by frequency
-    k_threshold : int, default=1
+    k_threshold : int, default=2
         Key-LOO threshold (inclusive: >= k_threshold).
         - k_threshold=1: Keeps all keys (no filtering)
         - k_threshold=2: Filters out keys appearing in only 1 molecule
@@ -630,7 +630,7 @@ class MultiTaskPrevalenceGenerator:
                  sim_thresh: float = 0.5,
                  num_threads: int = -1,
                  counting_method: str = 'counting',
-                 k_threshold: int = 1,
+                 k_threshold: int = 2,
                  loo_smoothing_tau: float = 1.0):
         
         self.radius = radius
@@ -680,7 +680,7 @@ class MultiTaskPrevalenceGenerator:
             counting_method=self.counting_method,
             use_key_loo=use_key_loo,
             verbose=False,  # Disable verbose by default
-            k_threshold=k_threshold,  # NEW: Configurable k_threshold (default=1 keeps all keys)
+            k_threshold=k_threshold,  # NEW: Configurable k_threshold (default=2 filters singletons)
             loo_smoothing_tau=loo_smoothing_tau  # NEW: Smoothed LOO rescaling (tau=1.0 prevents singleton zeroing)
         )
         
@@ -985,7 +985,7 @@ class MultiTaskPrevalenceGenerator:
             sim_thresh=state.get('sim_thresh', 0.5),
             num_threads=state.get('num_threads', -1),
             counting_method=state.get('counting_method_name', 'counting'),
-            k_threshold=state.get('k_threshold', 1),  # NEW: Restore k_threshold (default=1 for backward compatibility)
+            k_threshold=state.get('k_threshold', 2),  # NEW: Restore k_threshold (default=2 filters singletons)
             loo_smoothing_tau=state.get('loo_smoothing_tau', 1.0),  # NEW: Restore loo_smoothing_tau (default=1.0 for backward compatibility)
         )
         

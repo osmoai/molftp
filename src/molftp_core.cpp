@@ -4226,7 +4226,7 @@ public:
         CountingMethod counting_method = CountingMethod::COUNTING,
         bool use_key_loo = true,  // NEW: Enable/disable Key-LOO filtering
         bool verbose = true,  // NEW: Enable/disable verbose output
-        int k_threshold = 1,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=1 keeps all keys
+        int k_threshold = 2,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=2 filters singletons
         double loo_smoothing_tau = 1.0  // NEW: Smoothing parameter for LOO rescaling. tau=1.0 means singletons get factor 0.5 instead of 0
     ) : radius_(radius), nBits_(nBits), sim_thresh_(sim_thresh),
         stat_1d_(stat_1d), stat_2d_(stat_2d), stat_3d_(stat_3d),
@@ -5014,7 +5014,7 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("counting_method") = CountingMethod::COUNTING,
              py::arg("use_key_loo") = true,  // NEW: Enable/disable Key-LOO (true=Key-LOO, false=Dummy-Masking)
              py::arg("verbose") = false,  // NEW: Enable/disable verbose output
-             py::arg("k_threshold") = 1,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=1 keeps all keys
+             py::arg("k_threshold") = 2,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=2 filters singletons
              py::arg("loo_smoothing_tau") = 1.0,  // NEW: Smoothing parameter for LOO rescaling (tau=1.0 prevents singleton zeroing)
              "Initialize Multi-Task Prevalence Generator\n"
              "use_key_loo=True: Key-LOO filtering (for Key-LOO multi-task)\n"

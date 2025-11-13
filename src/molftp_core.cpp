@@ -14,6 +14,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <RDGeneral/export.h>
 #include <GraphMol/RDKitBase.h>
@@ -2283,21 +2286,26 @@ public:
                               const vector<bool>* train_row_mask = nullptr,
                               const unordered_map<string, double>* scale_1d = nullptr,
                               const unordered_map<string, double>* scale_2d = nullptr,
-                              const unordered_map<string, double>* scale_3d = nullptr) {
+                              const unordered_map<string, double>* scale_3d = nullptr,
+                              int num_threads = 0) {
         
         const int n_molecules = smiles.size();
         
         // For non-max aggregation, use generate_ftp_vector per view
         if (atom_aggregation != "max") {
-            vector<vector<double>> V1, V2, V3;
-            V1.reserve(n_molecules);
-            V2.reserve(n_molecules);
-            V3.reserve(n_molecules);
+            vector<vector<double>> V1(n_molecules), V2(n_molecules), V3(n_molecules);
             
+            // OpenMP parallelization for non-max aggregation
+            #ifdef _OPENMP
+            if (num_threads > 0) {
+                omp_set_num_threads(num_threads);
+            }
+            #pragma omp parallel for if(num_threads != 1)
+            #endif
             for (int i = 0; i < n_molecules; ++i) {
-                V1.push_back(generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature));
-                V2.push_back(generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature));
-                V3.push_back(generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature));
+                V1[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature);
+                V2[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature);
+                V3[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
             }
             
             return make_tuple(std::move(V1), std::move(V2), std::move(V3));
@@ -2338,6 +2346,13 @@ public:
         key_buffer.reserve(32);
         
         // NUCLEAR-FAST: Process all molecules with inline vector computation
+        // OpenMP parallelization for max aggregation
+        #ifdef _OPENMP
+        if (num_threads > 0) {
+            omp_set_num_threads(num_threads);
+        }
+        #pragma omp parallel for if(num_threads != 1) private(key_buffer)
+        #endif
         for (int i = 0; i < n_molecules; ++i) {
             try {
                 ROMol* mol = SmilesToMol(smiles[i]);
@@ -3257,7 +3272,8 @@ public:
         const string& atom_aggregation = "max",
         double softmax_temperature = 1.0,
         double loo_smoothing_tau = 1.0,  // NEW: Smoothing parameter for LOO rescaling
-        const vector<bool>* train_row_mask = nullptr  // NEW: Per-molecule training mask for rescaling
+        const vector<bool>* train_row_mask = nullptr,  // NEW: Per-molecule training mask for rescaling
+        int num_threads = 0  // NEW: Number of threads for parallelization (0=auto)
     ) {
         // Create filtered prevalence dictionaries using PRE-COMPUTED counts
         // This ensures vectors are independent of batch size!
@@ -3376,7 +3392,8 @@ public:
             train_mask_ptr,  // Pass train_row_mask for per-molecule check
             scale_1d.empty() ? nullptr : &scale_1d,  // Pass scale maps if rescaling enabled
             scale_2d.empty() ? nullptr : &scale_2d,
-            scale_3d.empty() ? nullptr : &scale_3d
+            scale_3d.empty() ? nullptr : &scale_3d,
+            num_threads  // NEW: Pass num_threads for OpenMP parallelization
         );
         
         return make_tuple(V1, V2, V3);
@@ -4538,7 +4555,8 @@ public:
                     "max",  // FIXED: Match Python PrevalenceGenerator default
                     1.0,
                     loo_smoothing_tau_,  // NEW: Smoothed LOO rescaling (tau=1.0 prevents singleton zeroing)
-                    train_row_mask  // NEW: Per-molecule training mask for rescaling
+                    train_row_mask,  // NEW: Per-molecule training mask for rescaling
+                    num_threads_  // NEW: Pass num_threads_ for OpenMP parallelization
                 );
             } else {
                 // Dummy-Masking: Simple prevalence, NO Key-LOO filtering!
@@ -4561,7 +4579,8 @@ public:
                     "max",  // FIXED: Match Python PrevalenceGenerator default
                     1.0,
                     loo_smoothing_tau_,  // Not used when rescaling is disabled, but keep for consistency
-                    nullptr  // train_row_mask = nullptr (no rescaling for Dummy-Masking)
+                    nullptr,  // train_row_mask = nullptr (no rescaling for Dummy-Masking)
+                    num_threads_  // NEW: Pass num_threads_ for OpenMP parallelization
                 );
             }
             
@@ -4877,7 +4896,7 @@ PYBIND11_MODULE(_molftp, m) {
                  // They're computed and passed internally in build_vectors_with_key_loo_fixed
                  return self.build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d,
                                                       atom_gate, atom_aggregation, softmax_temperature,
-                                                      train_mask_ptr, nullptr, nullptr, nullptr);
+                                                      train_mask_ptr, nullptr, nullptr, nullptr, 0);  // num_threads=0 (auto)
              },
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
@@ -4974,6 +4993,7 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
              py::arg("loo_smoothing_tau") = 1.0,  // NEW: Smoothing parameter for LOO rescaling
              py::arg("train_row_mask") = py::none(),  // NEW: Per-molecule training mask for rescaling
+             py::arg("num_threads") = 0,  // NEW: Number of threads for OpenMP parallelization (0=auto)
              "Fixed Key-LOO that works for inference on new data (batch-independent)")
         .def("build_vectors_with_efficient_key_loo", &VectorizedFTPGenerator::build_vectors_with_efficient_key_loo,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),

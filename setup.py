@@ -106,6 +106,10 @@ if rdkit_headers_available:
                 '-O3',
                 '-ffast-math',
                 '-march=native'
+                # Note: OpenMP support is optional and conditional in code (#ifdef _OPENMP)
+                # To enable OpenMP on macOS, install libomp: brew install libomp
+                # Then add: '-Xpreprocessor', '-fopenmp' to extra_compile_args
+                # And: '-lomp' to extra_link_args
             ],
         ),
     ]

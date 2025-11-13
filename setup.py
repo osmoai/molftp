@@ -78,6 +78,7 @@ library_dirs = [
     conan_boost_lib,
     rdkit_lib,  # Use RDKit libs
     '/opt/homebrew/lib', # Homebrew lib
+    '/opt/homebrew/Cellar/libomp/21.1.5/lib',  # OpenMP library (libomp)
 ]
 
 # Check if RDKit headers are available
@@ -105,11 +106,11 @@ if rdkit_headers_available:
                 '-mmacosx-version-min=10.14',
                 '-O3',
                 '-ffast-math',
-                '-march=native'
-                # Note: OpenMP support is optional and conditional in code (#ifdef _OPENMP)
-                # To enable OpenMP on macOS, install libomp: brew install libomp
-                # Then add: '-Xpreprocessor', '-fopenmp' to extra_compile_args
-                # And: '-lomp' to extra_link_args
+                '-march=native',
+                '-Xpreprocessor', '-fopenmp'  # OpenMP support (libomp installed)
+            ],
+            extra_link_args=[
+                '-lomp'  # Link OpenMP library
             ],
         ),
     ]

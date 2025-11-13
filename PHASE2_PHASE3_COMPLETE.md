@@ -93,6 +93,6 @@ For 69k molecules:
 **Branch**: `feat/indexed-miners-speedup-v1.6.0`  
 **Commits**: 2 commits (Phase 1 + Phase 2 & 3)  
 **Version**: 1.6.0  
-**Date**: 2025-01-13  
+**Date**: 2025-11-13 (November 13, 2025)  
 **Status**: ✅ Complete
 

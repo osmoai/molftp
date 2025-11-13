@@ -175,5 +175,5 @@ For larger datasets (69k molecules):
 
 **Status**: ✅ Complete and tested  
 **Version**: MolFTP 1.6.0 (with Phase 2 & 3)  
-**Date**: 2025-01-13
+**Date**: 2025-11-13 (November 13, 2025)
 

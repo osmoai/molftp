@@ -704,7 +704,9 @@ class MultiTaskPrevalenceGenerator:
         Parameters
         ----------
         smiles : list of str
-            List of SMILES strings
+            List of SMILES strings.
+            **CRITICAL for Key-LOO with scaffold-based splitting**: Fit on train+valid
+            to avoid filtering out keys from validation scaffolds. See Notes below.
         labels : np.ndarray
             Labels array with shape (n_samples,) for single-task or (n_samples, n_tasks) for multi-task.
             NaN values indicate missing labels for that task.
@@ -722,6 +724,32 @@ class MultiTaskPrevalenceGenerator:
         - NaN labels are handled internally by the C++ backend
         - For Key-LOO: Key counts are computed on measured molecules only (non-NaN per task)
         - For Dummy-Masking: Full prevalence is built, masking is applied during transform()
+        
+        **Critical Issue with Scaffold-Based Splitting:**
+        
+        When using scaffold-based splitting with Key-LOO, validation scaffolds are often
+        completely unique (not seen in training). If you fit Key-LOO on train-only:
+        
+        - Keys from validation scaffolds were NOT seen in training
+        - These keys get filtered out (k_threshold filtering)
+        - Validation molecules get mostly ZERO features
+        - Performance degrades dramatically (e.g., PR-AUC 0.5252 vs 0.9711)
+        
+        **Solution:** Fit on train+valid, then apply rescaling only to training molecules:
+        
+        .. code-block:: python
+        
+            # Fit on ALL data (train+valid)
+            transformer.fit(all_smiles, all_labels, task_names=['task1'])
+            
+            # Transform training (WITH rescaling)
+            X_train = transformer.transform(train_smiles, train_row_mask=np.ones(len(train_smiles), dtype=bool))
+            
+            # Transform validation (WITHOUT rescaling - inference mode)
+            X_valid = transformer.transform(valid_smiles, train_row_mask=None)
+        
+        This ensures all scaffolds are seen during fitting, while still applying
+        Key-LOO rescaling only to training molecules.
         """
         # Handle single-task input
         if labels.ndim == 1:

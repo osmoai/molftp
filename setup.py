@@ -140,6 +140,7 @@ ext_modules = [
             "RDKitRDGeneral"
         ],
         library_dirs=library_dirs,
+        extra_link_args=['-Wl,-rpath,@loader_path/rdkit/.dylibs'] if sys.platform == 'darwin' else [],
         language='c++',
         cxx_std=17,
         define_macros=[('PYBIND11_SIMPLE_GIL_MANAGEMENT', None)],

@@ -17,8 +17,13 @@
 #include <climits>
 #include <cstdlib>
 
-// RDKit headers first (these include Boost.Python via Python.h)
-// RDKit's Python.h handles Boost.Python setup correctly
+// Include system Python.h FIRST to establish Python API
+// This prevents pybind11 from including Python.h through RDKit
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+// RDKit headers (these include Boost.Python via rdkit/Python.h)
+// But system Python.h is already included, so Boost.Python will use it
 #include <RDGeneral/export.h>
 #include <GraphMol/RDKitBase.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
@@ -27,8 +32,8 @@
 #include <DataStructs/ExplicitBitVect.h>
 #include <DataStructs/BitVect.h>
 
-// pybind11 headers after RDKit (pybind11 can coexist with Boost.Python
-// when RDKit's Python.h is included first)
+// pybind11 headers last (system Python.h already included)
+// PYBIND11_SIMPLE_GIL_MANAGEMENT is defined in setup.py to avoid conflicts
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>

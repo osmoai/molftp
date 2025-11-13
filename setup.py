@@ -73,6 +73,7 @@ ext_modules = [
         library_dirs=library_dirs,
         language='c++',
         cxx_std=17,
+        define_macros=[('PYBIND11_SIMPLE_GIL_MANAGEMENT', None)],
         extra_compile_args=['-O3', '-march=native'] if sys.platform != 'win32' else ['/O2'],
     ),
 ]

@@ -668,6 +668,8 @@ class MultiTaskPrevalenceGenerator:
         use_key_loo = (method == 'key_loo')
         
         # Initialize C++ multi-task generator
+        # Note: k_threshold and loo_smoothing_tau are stored in Python but NOT passed to C++
+        # C++ uses default k_threshold=2 internally
         self.generator = ftp.MultiTaskPrevalenceGenerator(
             radius=self.radius,
             nBits=self.nBits,
@@ -676,12 +678,10 @@ class MultiTaskPrevalenceGenerator:
             stat_2d=self.stat_2d,
             stat_3d=self.stat_3d,
             alpha=self.alpha,
-            num_threads=self.num_threads,
+            num_threads=self.num_threads if self.num_threads > 0 else 0,  # C++ uses 0 for auto
             counting_method=self.counting_method,
             use_key_loo=use_key_loo,
-            verbose=False,  # Disable verbose by default
-            k_threshold=k_threshold,  # NEW: Configurable k_threshold (default=2 filters singletons)
-            loo_smoothing_tau=loo_smoothing_tau  # NEW: Smoothed LOO rescaling (tau=1.0 prevents singleton zeroing)
+            verbose=False  # Disable verbose by default
         )
         
         # State tracking

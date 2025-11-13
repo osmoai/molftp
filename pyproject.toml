@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=64", "wheel", "pybind11>=2.10", "numpy>=1.23,<2"]
+requires = ["setuptools>=61.0", "pybind11>=2.10.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "molftp"
-version = "1.4.0"
+version = "1.6.0"
 description = "Molecular Fragment-Target Prevalence: High-performance feature generation for molecular property prediction"
 readme = "README.md"
-requires-python = ">=3.11"
-license = {text = "BSD 3-Clause License"}
+requires-python = ">=3.8"
+license = {text = "MIT License"}
 keywords = ["molecular-features", "cheminformatics", "machine-learning", "molecular-property-prediction"]
 authors = [
   {name = "MolFTP Contributors"}
@@ -16,16 +16,17 @@ authors = [
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: BSD License",
+  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Topic :: Scientific/Engineering :: Chemistry",
 ]
 
 dependencies = [
-  "rdkit>=2025.3",
-  "numpy>=1.23,<2",
-  "pandas>=2.0",
-  "scikit-learn>=1.3",
+  "numpy>=1.19.0",
+  "pandas>=1.3.0",
+  "scikit-learn>=1.0.0",
+  "rdkit>=2022.3.0",
+  "pybind11>=2.10.0",
 ]
 
 [project.optional-dependencies]
@@ -33,17 +34,8 @@ dev = ["pytest>=7.0.0", "pytest-cov>=3.0.0"]
 ml = ["xgboost>=1.5.0", "lightgbm>=3.2.0"]
 
 [project.urls]
-Homepage = "https://github.com/osmoai/molftp"
-Documentation = "https://github.com/osmoai/molftp#readme"
-Repository = "https://github.com/osmoai/molftp.git"
-Issues = "https://github.com/osmoai/molftp/issues"
-
-[tool.setuptools]
-packages = ["molftp"]
-
-[tool.setuptools.package-data]
-molftp = ["*.so", "*.pyd", "*.dylib", "*.dll"]
-
-[tool.setuptools.package-dir]
-"" = "."
+Homepage = "https://github.com/yourusername/molftp"
+Documentation = "https://github.com/yourusername/molftp#readme"
+Repository = "https://github.com/yourusername/molftp.git"
+Issues = "https://github.com/yourusername/molftp/issues"
 

@@ -1,0 +1,349 @@
+[17:16:59] Can't kekulize mol.  Unkekulized atoms: 0 1 2 3 4 5 6 7 8
+  Measured samples: 1000 (100%)
+  Positive: 469 (46.9%)
+  Negative: 531 (53.1%)
+  Building 1D prevalence...
+  Building 2D prevalence...
+  Building 3D prevalence...
+  Skipping Key-LOO filtering (Dummy-Masking mode)...
+  ✅ Prevalence built for Biodegradable
+
+================================================================================
+✅ ALL TASK PREVALENCE BUILT (C++)!
+================================================================================
+Total tasks: 1
+Features per task: 27 (1D + 2D + 3D)
+Total features: 27
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 800
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371111 PASS_corrected=0.371111
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.371111 PASS_corrected=0.371111
+      DEBUG 1D key 2: N_full=1 N_train=1 factor=1 PASS_orig=0.371111 PASS_corrected=0.371111
+✅ (27 features, masked 1960 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (800, 27)
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 200
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371111 PASS_corrected=0.371111
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.371111 PASS_corrected=0.371111
+      DEBUG 1D key 2: N_full=2 N_train=2 factor=1 PASS_orig=1.55987 PASS_corrected=1.55987
+✅ (27 features, masked 8788 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (200, 27)
+================================================================================
+  Measured samples: 1000 (100%)
+  Positive: 451 (45.1%)
+  Negative: 549 (54.9%)
+  Building 1D prevalence...
+  Building 2D prevalence...
+  Building 3D prevalence...
+  Skipping Key-LOO filtering (Dummy-Masking mode)...
+  ✅ Prevalence built for Biodegradable
+
+================================================================================
+✅ ALL TASK PREVALENCE BUILT (C++)!
+================================================================================
+Total tasks: 1
+Features per task: 27 (1D + 2D + 3D)
+Total features: 27
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 800
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.403256 PASS_corrected=0.403256
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.403256 PASS_corrected=0.403256
+      DEBUG 1D key 2: N_full=1 N_train=1 factor=1 PASS_orig=0.403256 PASS_corrected=0.403256
+✅ (27 features, masked 1984 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (800, 27)
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 200
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.315421 PASS_corrected=0.315421
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.403256 PASS_corrected=0.403256
+      DEBUG 1D key 2: N_full=1 N_train=1 factor=1 PASS_orig=0.403256 PASS_corrected=0.403256
+✅ (27 features, masked 8893 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (200, 27)
+================================================================================
+  Measured samples: 2307 (100%)
+  Positive: 1081 (46.8574%)
+  Negative: 1226 (53.1426%)
+  Building 1D prevalence...
+  Building 2D prevalence...
+  Building 3D prevalence...
+  Skipping Key-LOO filtering (Dummy-Masking mode)...
+  ✅ Prevalence built for Biodegradable
+
+================================================================================
+✅ ALL TASK PREVALENCE BUILT (C++)!
+================================================================================
+Total tasks: 1
+Features per task: 27 (1D + 2D + 3D)
+Total features: 27
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 1845
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 1: N_full=2 N_train=2 factor=1 PASS_orig=0.687759 PASS_corrected=0.687759
+      DEBUG 1D key 2: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+✅ (27 features, masked 4647 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (1845, 27)
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 462
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 2: N_full=2 N_train=2 factor=1 PASS_orig=0.687759 PASS_corrected=0.687759
+✅ (27 features, masked 16773 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (462, 27)
+================================================================================
+  Measured samples: 2307 (100%)
+  Positive: 1081 (46.8574%)
+  Negative: 1226 (53.1426%)
+  Building 1D prevalence...
+  Building 2D prevalence...
+  Building 3D prevalence...
+  Skipping Key-LOO filtering (Dummy-Masking mode)...
+  ✅ Prevalence built for Biodegradable
+
+================================================================================
+✅ ALL TASK PREVALENCE BUILT (C++)!
+================================================================================
+Total tasks: 1
+Features per task: 27 (1D + 2D + 3D)
+Total features: 27
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 1845
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 1: N_full=2 N_train=2 factor=1 PASS_orig=0.687759 PASS_corrected=0.687759
+      DEBUG 1D key 2: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+✅ (27 features, masked 4647 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (1845, 27)
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 462
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (Biodegradable)... ================================================================================
+MOLFTP PERFORMANCE PROFILING - BIODEGRADATION DATASET
+================================================================================
+
+[Loading biodegradation dataset...]
+Fixing SMILES issues...
+Validating SMILES...
+  ✓ Valid SMILES: 2307 (filtered 1 invalid)
+  ✓ Loaded 2307 molecules
+  ✓ Positive: 1081 (46.9%)
+  ✓ Negative: 1226 (53.1%)
+
+################################################################################
+TESTING 1000 MOLECULES - LEGACY MODE
+################################################################################
+
+================================================================================
+PROFILING WITH 1000 MOLECULES - LEGACY (O(N²)) (num_threads=-1)
+================================================================================
+
+[1] Initializing MultiTaskPrevalenceGenerator...
+  ✓ Initialized in 0.000s
+
+[2] Fitting on 800 training molecules...
+  ✓ Fitted in 0.211s (0.26ms per molecule)
+
+[3] Transforming 800 training molecules...
+  ✓ Transformed training in 0.183s (0.23ms per molecule)
+
+[4] Transforming 200 validation molecules...
+  ✓ Transformed validation in 0.050s (0.25ms per molecule)
+
+================================================================================
+PERFORMANCE SUMMARY (LEGACY (O(N²)))
+================================================================================
+Total time: 0.444s
+Throughput: 2252.7 molecules/second
+Breakdown:
+  - Init: 0.000s (0.0%)
+  - Fit: 0.211s (47.5%)
+  - Transform (train): 0.183s (41.1%)
+  - Transform (valid): 0.050s (11.3%)
+================================================================================
+
+
+################################################################################
+TESTING 1000 MOLECULES - INDEXED MODE
+################################################################################
+
+================================================================================
+PROFILING WITH 1000 MOLECULES - INDEXED (new) (num_threads=-1)
+================================================================================
+
+[1] Initializing MultiTaskPrevalenceGenerator...
+  ✓ Initialized in 0.000s
+
+[2] Fitting on 800 training molecules...
+  ✓ Fitted in 0.071s (0.09ms per molecule)
+
+[3] Transforming 800 training molecules...
+  ✓ Transformed training in 0.183s (0.23ms per molecule)
+
+[4] Transforming 200 validation molecules...
+  ✓ Transformed validation in 0.050s (0.25ms per molecule)
+
+================================================================================
+PERFORMANCE SUMMARY (INDEXED (new))
+================================================================================
+Total time: 0.304s
+Throughput: 3289.2 molecules/second
+Breakdown:
+  - Init: 0.000s (0.0%)
+  - Fit: 0.071s (23.4%)
+  - Transform (train): 0.183s (60.1%)
+  - Transform (valid): 0.050s (16.5%)
+================================================================================
+
+
+⚠️  Skipping 5000 molecules (only 2307 available)
+
+################################################################################
+TESTING 2307 MOLECULES - LEGACY MODE
+################################################################################
+
+================================================================================
+PROFILING WITH 2307 MOLECULES - LEGACY (O(N²)) (num_threads=-1)
+================================================================================
+
+[1] Initializing MultiTaskPrevalenceGenerator...
+  ✓ Initialized in 0.000s
+
+[2] Fitting on 1845 training molecules...
+  ✓ Fitted in 0.794s (0.43ms per molecule)
+
+[3] Transforming 1845 training molecules...
+  ✓ Transformed training in 0.417s (0.23ms per molecule)
+
+[4] Transforming 462 validation molecules...
+  ✓ Transformed validation in 0.124s (0.27ms per molecule)
+
+================================================================================
+PERFORMANCE SUMMARY (LEGACY (O(N²)))
+================================================================================
+Total time: 1.336s
+Throughput: 1727.3 molecules/second
+Breakdown:
+  - Init: 0.000s (0.0%)
+  - Fit: 0.794s (59.5%)
+  - Transform (train): 0.417s (31.2%)
+  - Transform (valid): 0.124s (9.3%)
+================================================================================
+
+
+################################################################################
+TESTING 2307 MOLECULES - INDEXED MODE
+################################################################################
+
+================================================================================
+PROFILING WITH 2307 MOLECULES - INDEXED (new) (num_threads=-1)
+================================================================================
+
+[1] Initializing MultiTaskPrevalenceGenerator...
+  ✓ Initialized in 0.000s
+
+[2] Fitting on 1845 training molecules...
+  ✓ Fitted in 0.173s (0.09ms per molecule)
+
+[3] Transforming 1845 training molecules...
+  ✓ Transformed training in 0.504s (0.27ms per molecule)
+
+[4] Transforming 462 validation molecules...
+  ✓ Transformed validation in 0.126s (0.27ms per molecule)
+
+================================================================================
+PERFORMANCE SUMMARY (INDEXED (new))
+================================================================================
+Total time: 0.803s
+Throughput: 2872.4 molecules/second
+Breakdown:
+  - Init: 0.000s (0.0%)
+  - Fit: 0.173s (21.6%)
+  - Transform (train): 0.504s (62.7%)
+  - Transform (valid): 0.126s (15.7%)
+================================================================================
+
+
+✅ Results saved to: /Users/guillaume-osmo/Github/osmomain/src/sandbox/guillaume/biodegradation/biodeg2025/biodegradation_performance_comparison.json
+
+====================================================================================================
+PERFORMANCE COMPARISON: LEGACY vs INDEXED
+====================================================================================================
+Molecules    Method               Fit (s)      Total (s)    Fit Speedup     Total Speedup  
+----------------------------------------------------------------------------------------------------
+1000         Legacy (O(N^2))      0.211        0.444                                       
+             Indexed (new)        0.071        0.304        2.96           x 1.46           x
+
+2307         Legacy (O(N^2))      0.794        1.336                                       
+             Indexed (new)        0.173        0.803        4.58           x 1.66           x
+
+====================================================================================================
+KEY IMPROVEMENTS:
+====================================================================================================
+  1000 molecules: Fit 2.96x faster, Total 1.46x faster
+  2307 molecules: Fit 4.58x faster, Total 1.66x faster
+      DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 2: N_full=2 N_train=2 factor=1 PASS_orig=0.687759 PASS_corrected=0.687759
+✅ (27 features, masked 16773 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (462, 27)
+================================================================================

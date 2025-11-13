@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/guillaume-osmo/Github/rdkit-pypi/external/molftp/setup.py", line 80, in <module>
+    with open("README.md", "r", encoding="utf-8") as fh:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'README.md'

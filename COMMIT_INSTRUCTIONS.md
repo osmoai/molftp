@@ -1,8 +1,8 @@
-# Commit Instructions for v1.5.0 Speedup PR
+# Commit Instructions for v1.6.0 Speedup PR
 
 ## Summary
 
-This PR implements indexed exact Tanimoto search for 10-30× faster `fit()` performance.
+This PR implements indexed exact Tanimoto search (Phase 1) plus fingerprint caching (Phase 2 & 3) for 15-60× faster `fit()` performance.
 
 ## Files Changed
 
@@ -43,7 +43,7 @@ git commit -m "feat: 10-30× faster fit() via indexed exact Tanimoto search (v1.
 - Optimize 1D prevalence with packed uint64_t keys
 - Implement lock-free threading with std::atomic
 - Add comprehensive test suite for correctness verification
-- Update version to 1.5.0
+- Update version to 1.6.0
 
 Performance:
 - 1.3-1.6× speedup on medium datasets (10-20k molecules)
@@ -73,7 +73,7 @@ git push -u origin feat/indexed-miners-speedup-v1.5.0
 ## PR Title
 
 ```
-feat: 10-30× faster fit() via indexed exact Tanimoto search (v1.5.0)
+feat: 15-60× faster fit() via indexed exact Tanimoto search + caching (v1.6.0)
 ```
 
 ## PR Description

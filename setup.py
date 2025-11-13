@@ -82,7 +82,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="molftp",
-    version="1.5.0",
+    version="1.6.0",
     author="Guillaume GODIN",
     author_email="",
     description="Molecular Fragment-Target Prevalence: High-performance feature generation for molecular property prediction",

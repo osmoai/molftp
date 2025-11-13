@@ -2295,17 +2295,43 @@ public:
         if (atom_aggregation != "max") {
             vector<vector<double>> V1(n_molecules), V2(n_molecules), V3(n_molecules);
             
-            // OpenMP parallelization for non-max aggregation
-            #ifdef _OPENMP
+            // Use std::thread for consistency with rest of codebase (like build_3view_vectors_mode_threaded)
+            const int hw = (int)std::thread::hardware_concurrency();
+            int T = 1;
             if (num_threads > 0) {
-                omp_set_num_threads(num_threads);
+                T = num_threads;
+            } else if (num_threads == -1) {
+                T = (hw > 0) ? hw : 1;
+            } else if (num_threads == 0) {
+                T = (hw > 0) ? hw : 1;
             }
-            #pragma omp parallel for if(num_threads != 1)
-            #endif
-            for (int i = 0; i < n_molecules; ++i) {
-                V1[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature);
-                V2[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature);
-                V3[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
+            
+            if (T > 1 && n_molecules > 1) {
+                vector<thread> threads;
+                threads.reserve(T);
+                auto worker = [&](int start, int end) {
+                    for (int i = start; i < end; ++i) {
+                        V1[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature);
+                        V2[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature);
+                        V3[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
+                    }
+                };
+                int chunk = (n_molecules + T - 1) / T;
+                int s = 0;
+                for (int t = 0; t < T; ++t) {
+                    int e = min(n_molecules, s + chunk);
+                    if (s >= e) break;
+                    threads.emplace_back(worker, s, e);
+                    s = e;
+                }
+                for (auto& th : threads) th.join();
+            } else {
+                // Sequential fallback
+                for (int i = 0; i < n_molecules; ++i) {
+                    V1[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature);
+                    V2[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature);
+                    V3[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
+                }
             }
             
             return make_tuple(std::move(V1), std::move(V2), std::move(V3));
@@ -2341,19 +2367,28 @@ public:
         if (itP_3d != prevalence_data_3d.end()) pass_map_3d = &itP_3d->second;
         if (itF_3d != prevalence_data_3d.end()) fail_map_3d = &itF_3d->second;
         
-        // NUCLEAR-fast key building with pre-allocated buffer
-        string key_buffer;
-        key_buffer.reserve(32);
-        
         // NUCLEAR-FAST: Process all molecules with inline vector computation
-        // OpenMP parallelization for max aggregation
-        #ifdef _OPENMP
+        // Use std::thread for consistency with rest of codebase (like build_3view_vectors_mode_threaded)
+        const int hw = (int)std::thread::hardware_concurrency();
+        int T = 1;
         if (num_threads > 0) {
-            omp_set_num_threads(num_threads);
+            T = num_threads;
+        } else if (num_threads == -1) {
+            T = (hw > 0) ? hw : 1;
+        } else if (num_threads == 0) {
+            T = (hw > 0) ? hw : 1;
         }
-        #pragma omp parallel for if(num_threads != 1) private(key_buffer)
-        #endif
-        for (int i = 0; i < n_molecules; ++i) {
+        
+        if (T > 1 && n_molecules > 1) {
+            // Parallel processing with std::thread
+            vector<thread> threads;
+            threads.reserve(T);
+            auto worker = [&](int start, int end) {
+                // Thread-local key buffer
+                string key_buffer;
+                key_buffer.reserve(32);
+                
+                for (int i = start; i < end; ++i) {
             try {
                 ROMol* mol = SmilesToMol(smiles[i]);
                 if (!mol) continue;
@@ -2526,6 +2561,187 @@ public:
                 
             } catch (...) {
                 // Continue with next molecule on error
+            }
+                }
+            };
+            int chunk = (n_molecules + T - 1) / T;
+            int s = 0;
+            for (int t = 0; t < T; ++t) {
+                int e = min(n_molecules, s + chunk);
+                if (s >= e) break;
+                threads.emplace_back(worker, s, e);
+                s = e;
+            }
+            for (auto& th : threads) th.join();
+        } else {
+            // Sequential fallback
+            string key_buffer;
+            key_buffer.reserve(32);
+            
+            for (int i = 0; i < n_molecules; ++i) {
+                try {
+                    ROMol* mol = SmilesToMol(smiles[i]);
+                    if (!mol) continue;
+
+                    const int n_atoms = mol->getNumAtoms();
+                    if (n_atoms == 0) {
+                        delete mol;
+                        continue;
+                    }
+
+                    // NUCLEAR-fast: Inline prevalence arrays with exact size
+                    vector<double> prevalence_1d(n_atoms, 0.0);
+                    vector<double> prevalence_2d(n_atoms, 0.0);
+                    vector<double> prevalence_3d(n_atoms, 0.0);
+                    vector<vector<double>> prevalencer_1d(n_atoms, vector<double>(radius + 1, 0.0));
+                    vector<vector<double>> prevalencer_2d(n_atoms, vector<double>(radius + 1, 0.0));
+                    vector<vector<double>> prevalencer_3d(n_atoms, vector<double>(radius + 1, 0.0));
+
+                    // Get fingerprint info
+                    std::vector<boost::uint32_t>* invariants = nullptr;
+                    const std::vector<boost::uint32_t>* fromAtoms = nullptr;
+                    MorganFingerprints::BitInfoMap bitInfo;
+                    
+                    auto *siv = MorganFingerprints::getFingerprint(
+                        *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
+                        false, true, true, false, &bitInfo, false);
+
+                    // NUCLEAR-fast: Process bit info with inline vector computation
+                    for (const auto& kv : bitInfo) {
+                        unsigned int bit = kv.first;
+                        const auto& hits = kv.second;
+                        
+                        for (const auto& ad : hits) {
+                            unsigned int atomIdx = ad.first;
+                            unsigned int depth = ad.second;
+                            
+                            if (atomIdx >= static_cast<unsigned int>(n_atoms) || 
+                                depth > static_cast<unsigned int>(radius)) continue;
+                            
+                            // NUCLEAR-fast key building
+                            key_buffer.clear();
+                            key_buffer = "(";
+                            key_buffer += to_string(bit);
+                            key_buffer += ", ";
+                            key_buffer += to_string(depth);
+                            key_buffer += ")";
+                            
+                            // FIXED: Apply exact per-key rescaling for training molecules
+                            const bool is_train = train_row_mask && i < (int)train_row_mask->size() && (*train_row_mask)[i];
+                            double s1 = 1.0, s2 = 1.0, s3 = 1.0;
+                            if (is_train) {
+                                if (scale_1d) {
+                                    auto it = scale_1d->find(key_buffer);
+                                    if (it != scale_1d->end()) s1 = it->second;
+                                }
+                                if (scale_2d) {
+                                    auto it = scale_2d->find(key_buffer);
+                                    if (it != scale_2d->end()) s2 = it->second;
+                                }
+                                if (scale_3d) {
+                                    auto it = scale_3d->find(key_buffer);
+                                    if (it != scale_3d->end()) s3 = it->second;
+                                }
+                            }
+                            
+                            // Process prevalence with rescaling (same as parallel version)
+                            if (pass_map_1d) {
+                                auto itP = pass_map_1d->find(key_buffer);
+                                if (itP != pass_map_1d->end()) {
+                                    double w = itP->second * s1;
+                                    prevalence_1d[atomIdx] = std::max(prevalence_1d[atomIdx], w);
+                                    prevalencer_1d[atomIdx][depth] = std::max(prevalencer_1d[atomIdx][depth], w);
+                                }
+                            }
+                            if (fail_map_1d) {
+                                auto itF = fail_map_1d->find(key_buffer);
+                                if (itF != fail_map_1d->end()) {
+                                    double wneg = -(itF->second * s1);
+                                    prevalence_1d[atomIdx] = std::min(prevalence_1d[atomIdx], wneg);
+                                    prevalencer_1d[atomIdx][depth] = std::min(prevalencer_1d[atomIdx][depth], wneg);
+                                }
+                            }
+                            if (pass_map_2d) {
+                                auto itP = pass_map_2d->find(key_buffer);
+                                if (itP != pass_map_2d->end()) {
+                                    double w = itP->second * s2;
+                                    prevalence_2d[atomIdx] = std::max(prevalence_2d[atomIdx], w);
+                                    prevalencer_2d[atomIdx][depth] = std::max(prevalencer_2d[atomIdx][depth], w);
+                                }
+                            }
+                            if (fail_map_2d) {
+                                auto itF = fail_map_2d->find(key_buffer);
+                                if (itF != fail_map_2d->end()) {
+                                    double wneg = -(itF->second * s2);
+                                    prevalence_2d[atomIdx] = std::min(prevalence_2d[atomIdx], wneg);
+                                    prevalencer_2d[atomIdx][depth] = std::min(prevalencer_2d[atomIdx][depth], wneg);
+                                }
+                            }
+                            if (pass_map_3d) {
+                                auto itP = pass_map_3d->find(key_buffer);
+                                if (itP != pass_map_3d->end()) {
+                                    double w = itP->second * s3;
+                                    prevalence_3d[atomIdx] = std::max(prevalence_3d[atomIdx], w);
+                                    prevalencer_3d[atomIdx][depth] = std::max(prevalencer_3d[atomIdx][depth], w);
+                                }
+                            }
+                            if (fail_map_3d) {
+                                auto itF = fail_map_3d->find(key_buffer);
+                                if (itF != fail_map_3d->end()) {
+                                    double wneg = -(itF->second * s3);
+                                    prevalence_3d[atomIdx] = std::min(prevalence_3d[atomIdx], wneg);
+                                    prevalencer_3d[atomIdx][depth] = std::min(prevalencer_3d[atomIdx][depth], wneg);
+                                }
+                            }
+                        }
+                    }
+
+                    // Compute margins
+                    double denom = static_cast<double>(n_atoms);
+                    int p1 = 0, n1 = 0, p2 = 0, n2 = 0, p3 = 0, n3 = 0;
+                    for (int j = 0; j < n_atoms; ++j) {
+                        double v1 = prevalence_1d[j];
+                        double v2 = prevalence_2d[j];
+                        double v3 = prevalence_3d[j];
+                        p1 += (v1 >= atom_gate) ? 1 : 0;
+                        n1 += (v1 <= -atom_gate) ? 1 : 0;
+                        p2 += (v2 >= atom_gate) ? 1 : 0;
+                        n2 += (v2 <= -atom_gate) ? 1 : 0;
+                        p3 += (v3 >= atom_gate) ? 1 : 0;
+                        n3 += (v3 <= -atom_gate) ? 1 : 0;
+                    }
+                    
+                    V1[i][0] = static_cast<double>(p1 - n1);
+                    V1[i][1] = V1[i][0] / denom;
+                    V2[i][0] = static_cast<double>(p2 - n2);
+                    V2[i][1] = V2[i][0] / denom;
+                    V3[i][0] = static_cast<double>(p3 - n3);
+                    V3[i][1] = V3[i][0] / denom;
+                    
+                    // Per-depth computation
+                    for (int d = 0; d <= radius; ++d) {
+                        int pos1 = 0, neg1 = 0, pos2 = 0, neg2 = 0, pos3 = 0, neg3 = 0;
+                        for (int a = 0; a < n_atoms; ++a) {
+                            double v1 = prevalencer_1d[a][d];
+                            double v2 = prevalencer_2d[a][d];
+                            double v3 = prevalencer_3d[a][d];
+                            pos1 += (v1 >= atom_gate) ? 1 : 0;
+                            neg1 += (v1 <= -atom_gate) ? 1 : 0;
+                            pos2 += (v2 >= atom_gate) ? 1 : 0;
+                            neg2 += (v2 <= -atom_gate) ? 1 : 0;
+                            pos3 += (v3 >= atom_gate) ? 1 : 0;
+                            neg3 += (v3 <= -atom_gate) ? 1 : 0;
+                        }
+                        V1[i][2 + d] = static_cast<double>(pos1 - neg1) / denom;
+                        V2[i][2 + d] = static_cast<double>(pos2 - neg2) / denom;
+                        V3[i][2 + d] = static_cast<double>(pos3 - neg3) / denom;
+                    }
+                    
+                    if (siv) delete siv;
+                    delete mol;
+                } catch (...) {
+                    // Skip invalid molecules
+                }
             }
         }
         

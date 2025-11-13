@@ -51,7 +51,14 @@ This PR fixes critical bugs in the Key-LOO implementation and improves performan
 - `src/molftp_core.cpp`: Added `loo_smoothing_tau` parameter (default: 1.0)
 - `molftp/prevalence.py`: Added `loo_smoothing_tau` parameter to `MultiTaskPrevalenceGenerator`
 
-### 2. **train_row_mask Parameter** ✅
+### 2. **Default k_threshold Changed to 2** ✅
+**Implementation**: Changed default `k_threshold` from 1 to 2 for `MultiTaskPrevalenceGenerator`. This filters out singleton keys (keys appearing in only 1 molecule) by default, which is the recommended setting for Key-LOO.
+
+**Files Changed**:
+- `molftp/prevalence.py`: Updated default parameter and docstrings
+- `src/molftp_core.cpp`: Updated C++ constructor and pybind11 bindings
+
+### 3. **train_row_mask Parameter** ✅
 **Implementation**: Added `train_row_mask` parameter to `transform()` method to control which molecules get rescaled.
 
 **Usage**:

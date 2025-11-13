@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
+#include <atomic>
+#include <mutex>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -2248,32 +2250,155 @@ public:
                                                                const vector<int>& labels,
                                                                int fp_radius=2,
                                                                int nBits_local=2048,
-                                                               double sim_thresh_local=0.85) {
+                                                               double sim_thresh_local=0.85,
+                                                               int num_threads=0) {  // PERF: Add num_threads parameter
         const int n = (int)smiles.size();
         vector<int> idx(n); iota(idx.begin(), idx.end(), 0);
-        // Precompute FPS once
+        
+        // PERF: Precompute FPS once (can be parallelized but usually fast)
         vector<ExplicitBitVect*> fps; fps.reserve(n);
         for (int i=0;i<n;++i){ ROMol* m=nullptr; try{ m=SmilesToMol(smiles[i]); }catch(...){ m=nullptr; }
             fps.push_back(m? MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits_local):nullptr);
             if (m) delete m; }
+        
+        // PERF: Thread-safe triplets collection
         vector<tuple<int,int,int,double,double>> trips;
-        trips.reserve(n/2);
-        for (int i=0;i<n;++i){ if (!fps[i]) continue; 
-            vector<double> sims(n, -1.0);
-            for (int j=0;j<n;++j){ if (!fps[j]) continue; sims[j] = (i==j)? -1.0 : TanimotoSimilarity(*fps[i], *fps[j]); }
-            // argmax in each class
-            int iP=-1, iF=-1; double sP=-1.0, sF=-1.0;
-            for (int j=0;j<n;++j){ if (j==i || !fps[j]) continue; double s=sims[j];
-                if (labels[j]==1){ if (s>sP){ sP=s; iP=j; } }
-                else { if (s>sF){ sF=s; iF=j; } }
-            }
-            if (iP>=0 && iF>=0 && sP>=sim_thresh_local && sF>=sim_thresh_local){ trips.emplace_back(i, iP, iF, sP, sF); }
+        mutex trips_mutex;
+        
+        // PERF: Determine thread count
+        const int hw = (int)std::thread::hardware_concurrency();
+        int T = 1;
+        if (num_threads > 0) {
+            T = num_threads;
+        } else if (num_threads == -1) {
+            T = (hw > 0) ? hw : 1;
+        } else if (num_threads == 0) {
+            T = (hw > 0) ? hw : 1;
         }
+        
+        // PERF: Parallelize anchor loop
+        if (T > 1 && n > 1) {
+            py::gil_scoped_release nogil;
+            
+            vector<thread> threads;
+            threads.reserve(T);
+            
+            auto worker = [&](int start, int end) {
+                vector<tuple<int,int,int,double,double>> local_trips;
+                local_trips.reserve((end - start) / 2);  // Estimate
+                
+                for (int i=start; i<end; ++i) {
+                    if (!fps[i]) continue;
+                    
+                    // PERF: Compute similarities to all molecules (this is the expensive part)
+                    vector<double> sims(n, -1.0);
+                    for (int j=0;j<n;++j){ 
+                        if (!fps[j]) continue; 
+                        sims[j] = (i==j)? -1.0 : TanimotoSimilarity(*fps[i], *fps[j]); 
+                    }
+                    
+                    // argmax in each class
+                    int iP=-1, iF=-1; double sP=-1.0, sF=-1.0;
+                    for (int j=0;j<n;++j){ 
+                        if (j==i || !fps[j]) continue; 
+                        double s=sims[j];
+                        if (labels[j]==1){ if (s>sP){ sP=s; iP=j; } }
+                        else { if (s>sF){ sF=s; iF=j; } }
+                    }
+                    if (iP>=0 && iF>=0 && sP>=sim_thresh_local && sF>=sim_thresh_local){ 
+                        local_trips.emplace_back(i, iP, iF, sP, sF); 
+                    }
+                }
+                
+                // Merge local triplets (thread-safe)
+                if (!local_trips.empty()) {
+                    lock_guard<mutex> lock(trips_mutex);
+                    trips.insert(trips.end(), local_trips.begin(), local_trips.end());
+                }
+            };
+            
+            int chunk = (n + T - 1) / T;
+            int s = 0;
+            for (int t = 0; t < T; ++t) {
+                int e = min(n, s + chunk);
+                if (s >= e) break;
+                threads.emplace_back(worker, s, e);
+                s = e;
+            }
+            for (auto& th : threads) th.join();
+        } else {
+            // Sequential fallback
+            trips.reserve(n/2);
+            for (int i=0;i<n;++i){ if (!fps[i]) continue; 
+                vector<double> sims(n, -1.0);
+                for (int j=0;j<n;++j){ if (!fps[j]) continue; sims[j] = (i==j)? -1.0 : TanimotoSimilarity(*fps[i], *fps[j]); }
+                // argmax in each class
+                int iP=-1, iF=-1; double sP=-1.0, sF=-1.0;
+                for (int j=0;j<n;++j){ if (j==i || !fps[j]) continue; double s=sims[j];
+                    if (labels[j]==1){ if (s>sP){ sP=s; iP=j; } }
+                    else { if (s>sF){ sF=s; iF=j; } }
+                }
+                if (iP>=0 && iF>=0 && sP>=sim_thresh_local && sF>=sim_thresh_local){ trips.emplace_back(i, iP, iF, sP, sF); }
+            }
+        }
+        
         for (auto *f: fps) if (f) delete f;
         return trips;
     }
     // NUCLEAR-FAST vector generation - single-pass processing, zero allocations
     // For non-"max" aggregation, falls back to generate_ftp_vector per view
+    // Helper: Convert map<string,double> to unordered_map for O(1) lookups
+    static inline unordered_map<string, double> to_umap(const map<string, double>& m) {
+        unordered_map<string, double> u;
+        u.reserve(m.size() * 1.3);  // Leave headroom to avoid rehash
+        for (const auto& kv : m) {
+            u.emplace(kv.first, kv.second);
+        }
+        return u;
+    }
+    
+    // Helper: Pack (bit, depth) into uint64_t for fast numeric keys
+    static inline uint64_t pack_key(uint32_t bit, uint8_t depth) {
+        return (uint64_t(bit) << 8) | uint64_t(depth);
+    }
+    
+    // Helper: Unpack uint64_t key to (bit, depth)
+    static inline void unpack_key(uint64_t k, uint32_t& bit, uint8_t& depth) {
+        depth = uint8_t(k & 0xFF);
+        bit = uint32_t(k >> 8);
+    }
+    
+    // Helper: Convert string key "(bit, depth)" to uint64_t (for backward compatibility)
+    static inline uint64_t parse_key(const string& key_str) {
+        uint32_t bit;
+        uint8_t depth;
+        if (sscanf(key_str.c_str(), "(%u, %hhu)", &bit, &depth) == 2) {
+            return pack_key(bit, depth);
+        }
+        return 0;  // Invalid key
+    }
+    
+    // Helper: Build numeric lookup maps from string maps
+    struct ViewLookupNumeric {
+        unordered_map<uint64_t, double> pass, fail;
+    };
+    
+    static ViewLookupNumeric build_numeric_lookup(const map<string, double>& pass_m,
+                                                   const map<string, double>& fail_m) {
+        ViewLookupNumeric v;
+        v.pass.reserve(pass_m.size() * 1.3);
+        v.fail.reserve(fail_m.size() * 1.3);
+        for (const auto& kv : pass_m) {
+            uint64_t key = parse_key(kv.first);
+            if (key != 0) v.pass.emplace(key, kv.second);
+        }
+        for (const auto& kv : fail_m) {
+            uint64_t key = parse_key(kv.first);
+            if (key != 0) v.fail.emplace(key, kv.second);
+        }
+        return v;
+    }
+
     tuple<vector<vector<double>>, vector<vector<double>>, vector<vector<double>>>
     build_3view_vectors_batch(const vector<string>& smiles,
                               int radius,
@@ -2288,7 +2413,6 @@ public:
                               const unordered_map<string, double>* scale_2d = nullptr,
                               const unordered_map<string, double>* scale_3d = nullptr,
                               int num_threads = 0) {
-        
         const int n_molecules = smiles.size();
         
         // For non-max aggregation, use generate_ftp_vector per view
@@ -2345,13 +2469,9 @@ public:
         vector<vector<double>> V2(n_molecules, vector<double>(cols, 0.0));
         vector<vector<double>> V3(n_molecules, vector<double>(cols, 0.0));
         
-        // Pre-compute lookup references for NUCLEAR-fast access
-        const map<string, double>* pass_map_1d = nullptr;
-        const map<string, double>* fail_map_1d = nullptr;
-        const map<string, double>* pass_map_2d = nullptr;
-        const map<string, double>* fail_map_2d = nullptr;
-        const map<string, double>* pass_map_3d = nullptr;
-        const map<string, double>* fail_map_3d = nullptr;
+        // PERF: Convert to unordered_map for O(1) lookups and numeric keys for speed
+        ViewLookupNumeric lookup_1d, lookup_2d, lookup_3d;
+        unordered_map<uint64_t, double> scale_numeric_1d, scale_numeric_2d, scale_numeric_3d;
         
         auto itP_1d = prevalence_data_1d.find("PASS");
         auto itF_1d = prevalence_data_1d.find("FAIL");
@@ -2360,12 +2480,47 @@ public:
         auto itP_3d = prevalence_data_3d.find("PASS");
         auto itF_3d = prevalence_data_3d.find("FAIL");
         
-        if (itP_1d != prevalence_data_1d.end()) pass_map_1d = &itP_1d->second;
-        if (itF_1d != prevalence_data_1d.end()) fail_map_1d = &itF_1d->second;
-        if (itP_2d != prevalence_data_2d.end()) pass_map_2d = &itP_2d->second;
-        if (itF_2d != prevalence_data_2d.end()) fail_map_2d = &itF_2d->second;
-        if (itP_3d != prevalence_data_3d.end()) pass_map_3d = &itP_3d->second;
-        if (itF_3d != prevalence_data_3d.end()) fail_map_3d = &itF_3d->second;
+        if (itP_1d != prevalence_data_1d.end() || itF_1d != prevalence_data_1d.end()) {
+            lookup_1d = build_numeric_lookup(
+                (itP_1d != prevalence_data_1d.end()) ? itP_1d->second : map<string, double>{},
+                (itF_1d != prevalence_data_1d.end()) ? itF_1d->second : map<string, double>{}
+            );
+        }
+        if (itP_2d != prevalence_data_2d.end() || itF_2d != prevalence_data_2d.end()) {
+            lookup_2d = build_numeric_lookup(
+                (itP_2d != prevalence_data_2d.end()) ? itP_2d->second : map<string, double>{},
+                (itF_2d != prevalence_data_2d.end()) ? itF_2d->second : map<string, double>{}
+            );
+        }
+        if (itP_3d != prevalence_data_3d.end() || itF_3d != prevalence_data_3d.end()) {
+            lookup_3d = build_numeric_lookup(
+                (itP_3d != prevalence_data_3d.end()) ? itP_3d->second : map<string, double>{},
+                (itF_3d != prevalence_data_3d.end()) ? itF_3d->second : map<string, double>{}
+            );
+        }
+        
+        // Convert scale maps to numeric keys
+        if (scale_1d) {
+            scale_numeric_1d.reserve(scale_1d->size() * 1.3);
+            for (const auto& kv : *scale_1d) {
+                uint64_t key = parse_key(kv.first);
+                if (key != 0) scale_numeric_1d.emplace(key, kv.second);
+            }
+        }
+        if (scale_2d) {
+            scale_numeric_2d.reserve(scale_2d->size() * 1.3);
+            for (const auto& kv : *scale_2d) {
+                uint64_t key = parse_key(kv.first);
+                if (key != 0) scale_numeric_2d.emplace(key, kv.second);
+            }
+        }
+        if (scale_3d) {
+            scale_numeric_3d.reserve(scale_3d->size() * 1.3);
+            for (const auto& kv : *scale_3d) {
+                uint64_t key = parse_key(kv.first);
+                if (key != 0) scale_numeric_3d.emplace(key, kv.second);
+            }
+        }
         
         // NUCLEAR-FAST: Process all molecules with inline vector computation
         // Use std::thread for consistency with rest of codebase (like build_3view_vectors_mode_threaded)
@@ -2380,14 +2535,14 @@ public:
         }
         
         if (T > 1 && n_molecules > 1) {
+            // PERF: Release GIL only during parallel computation
+            py::gil_scoped_release nogil;
+            
             // Parallel processing with std::thread
             vector<thread> threads;
             threads.reserve(T);
             auto worker = [&](int start, int end) {
-                // Thread-local key buffer
-                string key_buffer;
-                key_buffer.reserve(32);
-                
+                // PERF: Capture numeric lookups and scale maps by reference (no string buffer needed)
                 for (int i = start; i < end; ++i) {
             try {
                 ROMol* mol = SmilesToMol(smiles[i]);
@@ -2416,95 +2571,89 @@ public:
                     *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
                     false, true, true, false, &bitInfo, false);
 
-                // NUCLEAR-fast: Process bit info with inline vector computation
+                // PERF: Process bit info with numeric keys (no string building)
                 for (const auto& kv : bitInfo) {
-                    unsigned int bit = kv.first;
+                    uint32_t bit = kv.first;
                     const auto& hits = kv.second;
                     
                     for (const auto& ad : hits) {
                         unsigned int atomIdx = ad.first;
-                        unsigned int depth = ad.second;
+                        uint8_t depth = static_cast<uint8_t>(ad.second);
                         
                         if (atomIdx >= static_cast<unsigned int>(n_atoms) || 
-                            depth > static_cast<unsigned int>(radius)) continue;
+                            depth > static_cast<uint8_t>(radius)) continue;
                         
-                        // NUCLEAR-fast key building
-                        key_buffer.clear();
-                        key_buffer = "(";
-                        key_buffer += to_string(bit);
-                        key_buffer += ", ";
-                        key_buffer += to_string(depth);
-                        key_buffer += ")";
+                        // PERF: Use numeric key instead of string building
+                        uint64_t key = pack_key(bit, depth);
                         
-                        // FIXED: Apply exact per-key rescaling for training molecules
-                        // Check if this molecule is training and get per-key scale factors
+                        // PERF: Apply exact per-key rescaling for training molecules
                         const bool is_train = train_row_mask && i < (int)train_row_mask->size() && (*train_row_mask)[i];
                         double s1 = 1.0, s2 = 1.0, s3 = 1.0;
                         if (is_train) {
-                            if (scale_1d) {
-                                auto it = scale_1d->find(key_buffer);
-                                if (it != scale_1d->end()) s1 = it->second;
+                            if (!scale_numeric_1d.empty()) {
+                                auto it = scale_numeric_1d.find(key);
+                                if (it != scale_numeric_1d.end()) s1 = it->second;
                             }
-                            if (scale_2d) {
-                                auto it = scale_2d->find(key_buffer);
-                                if (it != scale_2d->end()) s2 = it->second;
+                            if (!scale_numeric_2d.empty()) {
+                                auto it = scale_numeric_2d.find(key);
+                                if (it != scale_numeric_2d.end()) s2 = it->second;
                             }
-                            if (scale_3d) {
-                                auto it = scale_3d->find(key_buffer);
-                                if (it != scale_3d->end()) s3 = it->second;
+                            if (!scale_numeric_3d.empty()) {
+                                auto it = scale_numeric_3d.find(key);
+                                if (it != scale_numeric_3d.end()) s3 = it->second;
                             }
                         }
                         
-                        // NUCLEAR-fast: Process all prevalence types inline with exact per-key rescaling
+                        // PERF: Process all prevalence types with numeric key lookups (O(1) unordered_map)
                         // 1D prevalence
-                        if (pass_map_1d) {
-                            auto itP = pass_map_1d->find(key_buffer);
-                            if (itP != pass_map_1d->end()) {
-                                double w = itP->second * s1;  // FIXED: Apply per-key rescaling
+                        if (!lookup_1d.pass.empty()) {
+                            auto itP = lookup_1d.pass.find(key);
+                            if (itP != lookup_1d.pass.end()) {
+                                double w = itP->second * s1;
                                 prevalence_1d[atomIdx] = std::max(prevalence_1d[atomIdx], w);
                                 prevalencer_1d[atomIdx][depth] = std::max(prevalencer_1d[atomIdx][depth], w);
                             }
                         }
-                        if (fail_map_1d) {
-                            auto itF = fail_map_1d->find(key_buffer);
-                            if (itF != fail_map_1d->end()) {
-                                double wneg = -(itF->second * s1);  // FIXED: Apply per-key rescaling to magnitude
+                        if (!lookup_1d.fail.empty()) {
+                            auto itF = lookup_1d.fail.find(key);
+                            if (itF != lookup_1d.fail.end()) {
+                                double wneg = -(itF->second * s1);
                                 prevalence_1d[atomIdx] = std::min(prevalence_1d[atomIdx], wneg);
                                 prevalencer_1d[atomIdx][depth] = std::min(prevalencer_1d[atomIdx][depth], wneg);
                             }
                         }
                         
                         // 2D prevalence
-                        if (pass_map_2d) {
-                            auto itP = pass_map_2d->find(key_buffer);
-                            if (itP != pass_map_2d->end()) {
-                                double w = itP->second * s2;  // FIXED: Apply per-key rescaling
+                        if (!lookup_2d.pass.empty()) {
+                            auto itP = lookup_2d.pass.find(key);
+                            if (itP != lookup_2d.pass.end()) {
+                                double w = itP->second * s2;
                                 prevalence_2d[atomIdx] = std::max(prevalence_2d[atomIdx], w);
                                 prevalencer_2d[atomIdx][depth] = std::max(prevalencer_2d[atomIdx][depth], w);
                             }
                         }
-                        if (fail_map_2d) {
-                            auto itF = fail_map_2d->find(key_buffer);
-                            if (itF != fail_map_2d->end()) {
-                                double wneg = -(itF->second * s2);  // FIXED: Apply per-key rescaling to magnitude
+                        if (!lookup_2d.fail.empty()) {
+                            auto itF = lookup_2d.fail.find(key);
+                            if (itF != lookup_2d.fail.end()) {
+                                double wneg = -(itF->second * s2);
                                 prevalence_2d[atomIdx] = std::min(prevalence_2d[atomIdx], wneg);
                                 prevalencer_2d[atomIdx][depth] = std::min(prevalencer_2d[atomIdx][depth], wneg);
                             }
                         }
                         
                         // 3D prevalence
-                        if (pass_map_3d) {
-                            auto itP = pass_map_3d->find(key_buffer);
-                            if (itP != pass_map_3d->end()) {
-                                double w = itP->second * s3;  // FIXED: Apply per-key rescaling
+                        if (!lookup_3d.pass.empty()) {
+                            auto itP = lookup_3d.pass.find(key);
+                            if (itP != lookup_3d.pass.end()) {
+                                double w = itP->second * s3;
                                 prevalence_3d[atomIdx] = std::max(prevalence_3d[atomIdx], w);
                                 prevalencer_3d[atomIdx][depth] = std::max(prevalencer_3d[atomIdx][depth], w);
                             }
                         }
-                        if (fail_map_3d) {
-                            auto itF = fail_map_3d->find(key_buffer);
-                            if (itF != fail_map_3d->end()) {
-                                double wneg = -(itF->second * s3);  // FIXED: Apply per-key rescaling to magnitude
+                        if (!lookup_3d.fail.empty()) {
+                            auto itF = lookup_3d.fail.find(key);
+                            if (itF != lookup_3d.fail.end()) {
+                                double wneg = -(itF->second * s3);
                                 prevalence_3d[atomIdx] = std::min(prevalence_3d[atomIdx], wneg);
                                 prevalencer_3d[atomIdx][depth] = std::min(prevalencer_3d[atomIdx][depth], wneg);
                             }
@@ -2573,11 +2722,12 @@ public:
                 s = e;
             }
             for (auto& th : threads) th.join();
+            // GIL automatically reacquired when nogil goes out of scope
         } else {
-            // Sequential fallback
-            string key_buffer;
-            key_buffer.reserve(32);
+            // PERF: Release GIL only during sequential computation
+            py::gil_scoped_release nogil;
             
+            // PERF: Sequential fallback with numeric keys (no string buffer needed)
             for (int i = 0; i < n_molecules; ++i) {
                 try {
                     ROMol* mol = SmilesToMol(smiles[i]);
@@ -2606,88 +2756,88 @@ public:
                         *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
                         false, true, true, false, &bitInfo, false);
 
-                    // NUCLEAR-fast: Process bit info with inline vector computation
+                    // PERF: Process bit info with numeric keys (no string building)
                     for (const auto& kv : bitInfo) {
-                        unsigned int bit = kv.first;
+                        uint32_t bit = kv.first;
                         const auto& hits = kv.second;
                         
                         for (const auto& ad : hits) {
                             unsigned int atomIdx = ad.first;
-                            unsigned int depth = ad.second;
+                            uint8_t depth = static_cast<uint8_t>(ad.second);
                             
                             if (atomIdx >= static_cast<unsigned int>(n_atoms) || 
-                                depth > static_cast<unsigned int>(radius)) continue;
+                                depth > static_cast<uint8_t>(radius)) continue;
                             
-                            // NUCLEAR-fast key building
-                            key_buffer.clear();
-                            key_buffer = "(";
-                            key_buffer += to_string(bit);
-                            key_buffer += ", ";
-                            key_buffer += to_string(depth);
-                            key_buffer += ")";
+                            // PERF: Use numeric key instead of string building
+                            uint64_t key = pack_key(bit, depth);
                             
-                            // FIXED: Apply exact per-key rescaling for training molecules
+                            // PERF: Apply exact per-key rescaling for training molecules
                             const bool is_train = train_row_mask && i < (int)train_row_mask->size() && (*train_row_mask)[i];
                             double s1 = 1.0, s2 = 1.0, s3 = 1.0;
                             if (is_train) {
-                                if (scale_1d) {
-                                    auto it = scale_1d->find(key_buffer);
-                                    if (it != scale_1d->end()) s1 = it->second;
+                                if (!scale_numeric_1d.empty()) {
+                                    auto it = scale_numeric_1d.find(key);
+                                    if (it != scale_numeric_1d.end()) s1 = it->second;
                                 }
-                                if (scale_2d) {
-                                    auto it = scale_2d->find(key_buffer);
-                                    if (it != scale_2d->end()) s2 = it->second;
+                                if (!scale_numeric_2d.empty()) {
+                                    auto it = scale_numeric_2d.find(key);
+                                    if (it != scale_numeric_2d.end()) s2 = it->second;
                                 }
-                                if (scale_3d) {
-                                    auto it = scale_3d->find(key_buffer);
-                                    if (it != scale_3d->end()) s3 = it->second;
+                                if (!scale_numeric_3d.empty()) {
+                                    auto it = scale_numeric_3d.find(key);
+                                    if (it != scale_numeric_3d.end()) s3 = it->second;
                                 }
                             }
                             
-                            // Process prevalence with rescaling (same as parallel version)
-                            if (pass_map_1d) {
-                                auto itP = pass_map_1d->find(key_buffer);
-                                if (itP != pass_map_1d->end()) {
+                            // PERF: Process all prevalence types with numeric key lookups (O(1) unordered_map)
+                            // 1D prevalence
+                            if (!lookup_1d.pass.empty()) {
+                                auto itP = lookup_1d.pass.find(key);
+                                if (itP != lookup_1d.pass.end()) {
                                     double w = itP->second * s1;
                                     prevalence_1d[atomIdx] = std::max(prevalence_1d[atomIdx], w);
                                     prevalencer_1d[atomIdx][depth] = std::max(prevalencer_1d[atomIdx][depth], w);
                                 }
                             }
-                            if (fail_map_1d) {
-                                auto itF = fail_map_1d->find(key_buffer);
-                                if (itF != fail_map_1d->end()) {
+                            if (!lookup_1d.fail.empty()) {
+                                auto itF = lookup_1d.fail.find(key);
+                                if (itF != lookup_1d.fail.end()) {
                                     double wneg = -(itF->second * s1);
                                     prevalence_1d[atomIdx] = std::min(prevalence_1d[atomIdx], wneg);
                                     prevalencer_1d[atomIdx][depth] = std::min(prevalencer_1d[atomIdx][depth], wneg);
                                 }
                             }
-                            if (pass_map_2d) {
-                                auto itP = pass_map_2d->find(key_buffer);
-                                if (itP != pass_map_2d->end()) {
+                            
+                            // 2D prevalence
+                            if (!lookup_2d.pass.empty()) {
+                                auto itP = lookup_2d.pass.find(key);
+                                if (itP != lookup_2d.pass.end()) {
                                     double w = itP->second * s2;
                                     prevalence_2d[atomIdx] = std::max(prevalence_2d[atomIdx], w);
                                     prevalencer_2d[atomIdx][depth] = std::max(prevalencer_2d[atomIdx][depth], w);
                                 }
                             }
-                            if (fail_map_2d) {
-                                auto itF = fail_map_2d->find(key_buffer);
-                                if (itF != fail_map_2d->end()) {
+                            if (!lookup_2d.fail.empty()) {
+                                auto itF = lookup_2d.fail.find(key);
+                                if (itF != lookup_2d.fail.end()) {
                                     double wneg = -(itF->second * s2);
                                     prevalence_2d[atomIdx] = std::min(prevalence_2d[atomIdx], wneg);
                                     prevalencer_2d[atomIdx][depth] = std::min(prevalencer_2d[atomIdx][depth], wneg);
                                 }
                             }
-                            if (pass_map_3d) {
-                                auto itP = pass_map_3d->find(key_buffer);
-                                if (itP != pass_map_3d->end()) {
+                            
+                            // 3D prevalence
+                            if (!lookup_3d.pass.empty()) {
+                                auto itP = lookup_3d.pass.find(key);
+                                if (itP != lookup_3d.pass.end()) {
                                     double w = itP->second * s3;
                                     prevalence_3d[atomIdx] = std::max(prevalence_3d[atomIdx], w);
                                     prevalencer_3d[atomIdx][depth] = std::max(prevalencer_3d[atomIdx][depth], w);
                                 }
                             }
-                            if (fail_map_3d) {
-                                auto itF = fail_map_3d->find(key_buffer);
-                                if (itF != fail_map_3d->end()) {
+                            if (!lookup_3d.fail.empty()) {
+                                auto itF = lookup_3d.fail.find(key);
+                                if (itF != lookup_3d.fail.end()) {
                                     double wneg = -(itF->second * s3);
                                     prevalence_3d[atomIdx] = std::min(prevalence_3d[atomIdx], wneg);
                                     prevalencer_3d[atomIdx][depth] = std::min(prevalencer_3d[atomIdx][depth], wneg);
@@ -3622,45 +3772,123 @@ public:
                                                           int fp_radius = 2,
                                                           int nBits_local = 2048,
                                                           double sim_thresh_local = 0.85,
-                                                          unsigned int seed = 0) {
+                                                          unsigned int seed = 0,
+                                                          int num_threads = 0) {  // PERF: Add num_threads parameter
         const int n = (int)smiles.size();
         // indices by class
         vector<int> idxP, idxF; idxP.reserve(n); idxF.reserve(n);
         for (int i=0;i<n;++i) ((labels[i]==1)? idxP:idxF).push_back(i);
 
-        // FAIL fingerprints (once)
+        // FAIL fingerprints (once) - PERF: Precompute all FAIL FPs
         vector<ExplicitBitVect*> fpsF; fpsF.reserve(idxF.size());
         for (int j : idxF) {
             ROMol* m=nullptr; try { m=SmilesToMol(smiles[j]); } catch (...) { m=nullptr; }
             fpsF.push_back(m ? MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits_local) : nullptr);
             if (m) delete m;
         }
-        vector<char> availF(idxF.size(), 1);
+        
+        // PERF: Thread-safe availability tracking
+        vector<atomic<char>> availF(idxF.size());
+        for (auto& a : availF) a.store(1);
 
         // PASS order shuffled
         mt19937 rng(seed);
         vector<int> order = idxP; shuffle(order.begin(), order.end(), rng);
 
-        vector<tuple<int,int,double>> pairs; pairs.reserve(idxP.size());
-        for (int iP : order) {
-            // FP for PASS iP
-            ROMol* mP=nullptr; try { mP=SmilesToMol(smiles[iP]); } catch (...) { mP=nullptr; }
-            if (!mP) continue;
-            unique_ptr<ExplicitBitVect> fpP(MorganFingerprints::getFingerprintAsBitVect(*mP, fp_radius, nBits_local));
-            delete mP;
-            if (!fpP) continue;
+        // PERF: Thread-safe pairs collection
+        vector<tuple<int,int,double>> pairs;
+        mutex pairs_mutex;
+        
+        // PERF: Determine thread count
+        const int hw = (int)std::thread::hardware_concurrency();
+        int T = 1;
+        if (num_threads > 0) {
+            T = num_threads;
+        } else if (num_threads == -1) {
+            T = (hw > 0) ? hw : 1;
+        } else if (num_threads == 0) {
+            T = (hw > 0) ? hw : 1;
+        }
+        
+        // PERF: Parallelize PASS loop
+        if (T > 1 && order.size() > 1) {
+            py::gil_scoped_release nogil;
+            
+            vector<thread> threads;
+            threads.reserve(T);
+            
+            auto worker = [&](int start, int end) {
+                vector<tuple<int,int,double>> local_pairs;
+                local_pairs.reserve((end - start) / 2);  // Estimate
+                
+                for (int idx = start; idx < end; ++idx) {
+                    int iP = order[idx];
+                    
+                    // FP for PASS iP
+                    ROMol* mP=nullptr; try { mP=SmilesToMol(smiles[iP]); } catch (...) { mP=nullptr; }
+                    if (!mP) continue;
+                    unique_ptr<ExplicitBitVect> fpP(MorganFingerprints::getFingerprintAsBitVect(*mP, fp_radius, nBits_local));
+                    delete mP;
+                    if (!fpP) continue;
 
-            // argmax over available FAILs
-            int bestJ = -1; double bestSim = -1.0;
-            for (size_t t=0; t<idxF.size(); ++t) {
-                if (!availF[t]) continue;
-                if (!fpsF[t]) continue;
-                double s = TanimotoSimilarity(*fpP, *fpsF[t]);
-                if (s > bestSim) { bestSim = s; bestJ = (int)t; }
+                    // argmax over available FAILs (with atomic check)
+                    int bestJ = -1; double bestSim = -1.0;
+                    for (size_t t=0; t<idxF.size(); ++t) {
+                        if (availF[t].load() == 0) continue;  // Already taken
+                        if (!fpsF[t]) continue;
+                        double s = TanimotoSimilarity(*fpP, *fpsF[t]);
+                        if (s > bestSim) { bestSim = s; bestJ = (int)t; }
+                    }
+                    
+                    // Try to claim bestJ atomically
+                    if (bestJ >= 0 && bestSim >= sim_thresh_local) {
+                        char expected = 1;
+                        if (availF[bestJ].compare_exchange_strong(expected, 0)) {
+                            // Successfully claimed
+                            local_pairs.emplace_back(iP, idxF[bestJ], bestSim);
+                        }
+                    }
+                }
+                
+                // Merge local pairs (thread-safe)
+                if (!local_pairs.empty()) {
+                    lock_guard<mutex> lock(pairs_mutex);
+                    pairs.insert(pairs.end(), local_pairs.begin(), local_pairs.end());
+                }
+            };
+            
+            int chunk = (order.size() + T - 1) / T;
+            int s = 0;
+            for (int t = 0; t < T; ++t) {
+                int e = min((int)order.size(), s + chunk);
+                if (s >= e) break;
+                threads.emplace_back(worker, s, e);
+                s = e;
             }
-            if (bestJ >= 0 && bestSim >= sim_thresh_local) {
-                pairs.emplace_back(iP, idxF[bestJ], bestSim);
-                availF[bestJ] = 0;
+            for (auto& th : threads) th.join();
+        } else {
+            // Sequential fallback
+            pairs.reserve(idxP.size());
+            for (int iP : order) {
+                // FP for PASS iP
+                ROMol* mP=nullptr; try { mP=SmilesToMol(smiles[iP]); } catch (...) { mP=nullptr; }
+                if (!mP) continue;
+                unique_ptr<ExplicitBitVect> fpP(MorganFingerprints::getFingerprintAsBitVect(*mP, fp_radius, nBits_local));
+                delete mP;
+                if (!fpP) continue;
+
+                // argmax over available FAILs
+                int bestJ = -1; double bestSim = -1.0;
+                for (size_t t=0; t<idxF.size(); ++t) {
+                    if (availF[t].load() == 0) continue;
+                    if (!fpsF[t]) continue;
+                    double s = TanimotoSimilarity(*fpP, *fpsF[t]);
+                    if (s > bestSim) { bestSim = s; bestJ = (int)t; }
+                }
+                if (bestJ >= 0 && bestSim >= sim_thresh_local) {
+                    pairs.emplace_back(iP, idxF[bestJ], bestSim);
+                    availF[bestJ].store(0);
+                }
             }
         }
 
@@ -3834,7 +4062,7 @@ public:
             }
             
             // Generate 2D prevalence
-            vector<tuple<int, int, double>> pairs_loo = make_pairs_balanced_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh, 0);
+            vector<tuple<int, int, double>> pairs_loo = make_pairs_balanced_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh, 0, 0);  // PERF: Add num_threads=0 (default)
             map<string, double> E2_loo_raw = build_2d_ftp_stats(smiles_loo, labels_loo, pairs_loo, radius, E1_loo_raw, stat_2d, 0.5);
             map<string, map<string, double>> E2_loo = {{"PASS", {}}, {"FAIL", {}}};
             
@@ -3851,7 +4079,7 @@ public:
             }
             
             // Generate 3D prevalence
-            vector<tuple<int, int, int, double, double>> trips_loo = make_triplets_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh);
+            vector<tuple<int, int, int, double, double>> trips_loo = make_triplets_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh, 0);  // PERF: Add num_threads=0 (default)
             map<string, double> E3_loo_raw = build_3d_ftp_stats(smiles_loo, labels_loo, trips_loo, radius, E1_loo_raw, stat_3d, 0.5);
             map<string, map<string, double>> E3_loo = {{"PASS", {}}, {"FAIL", {}}};
             
@@ -4027,6 +4255,9 @@ public:
             }
         };
         
+        // PERF: Release GIL only during parallel computation
+        py::gil_scoped_release nogil;
+        
         // Launch threads
         vector<thread> threads;
         threads.reserve(T);
@@ -4040,6 +4271,7 @@ public:
         
         // Wait for completion
         for (auto& th : threads) th.join();
+        // GIL automatically reacquired when nogil goes out of scope
         
         return all_keys;
     }
@@ -4221,6 +4453,7 @@ public:
         }
         
         for (auto& th : threads) th.join();
+        // GIL automatically reacquired when nogil goes out of scope
         
         // Merge thread-local counts (single-threaded, fast enough)
         map<string, int> a_counts, b_counts;
@@ -4561,7 +4794,7 @@ public:
             // Build pairs for 2D
             // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
             auto pairs = task_generators_[task_idx].make_pairs_balanced_cpp(
-                smiles_task, labels_task, 2, nBits_, sim_thresh_, 0
+                smiles_task, labels_task, 2, nBits_, sim_thresh_, 0, num_threads_  // PERF: Pass num_threads
             );
             auto prev_2d = task_generators_[task_idx].build_2d_ftp_stats(
                 smiles_task, labels_task, pairs, radius_, prev_1d, stat_2d_, alpha_
@@ -4571,7 +4804,7 @@ public:
             // Build triplets for 3D
             // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
             auto triplets = task_generators_[task_idx].make_triplets_cpp(
-                smiles_task, labels_task, 2, nBits_, sim_thresh_
+                smiles_task, labels_task, 2, nBits_, sim_thresh_, num_threads_  // PERF: Pass num_threads
             );
             auto prev_3d = task_generators_[task_idx].build_3d_ftp_stats(
                 smiles_task, labels_task, triplets, radius_, prev_1d, stat_3d_, alpha_
@@ -5182,10 +5415,10 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("triplets_per_anchor") = 2, py::arg("neighbor_max_use") = 15)
         .def("make_triplets_cpp", &VectorizedFTPGenerator::make_triplets_cpp,
              py::arg("smiles"), py::arg("labels"), py::arg("fp_radius") = 2,
-             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85)
+             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85, py::arg("num_threads") = 0)  // PERF: Add num_threads
         .def("make_pairs_balanced_cpp", &VectorizedFTPGenerator::make_pairs_balanced_cpp,
              py::arg("smiles"), py::arg("labels"), py::arg("fp_radius") = 2,
-             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85, py::arg("seed") = 0)
+             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85, py::arg("seed") = 0, py::arg("num_threads") = 0)  // PERF: Add num_threads
         .def("build_cv_vectors_with_dummy_masking", &VectorizedFTPGenerator::build_cv_vectors_with_dummy_masking,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
              py::arg("prevalence_data_1d_full"), py::arg("prevalence_data_2d_full"), py::arg("prevalence_data_3d_full"),

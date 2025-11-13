@@ -59,7 +59,14 @@ This release fixes critical bugs in the Key-LOO implementation and improves perf
 - `src/molftp_core.cpp`: Added `loo_smoothing_tau` parameter (default: 1.0)
 - `molftp/prevalence.py`: Added `loo_smoothing_tau` parameter to `MultiTaskPrevalenceGenerator`
 
-### 2. **Exact Per-Key Rescaling** ✅
+### 2. **Default k_threshold Changed to 2** ✅
+**Implementation**: Changed default `k_threshold` from 1 to 2 for `MultiTaskPrevalenceGenerator`. This filters out singleton keys (keys appearing in only 1 molecule) by default, which is the recommended setting for Key-LOO.
+
+**Files Changed**:
+- `molftp/prevalence.py`: Updated default parameter and docstrings
+- `src/molftp_core.cpp`: Updated C++ constructor and pybind11 bindings
+
+### 3. **Exact Per-Key Rescaling** ✅
 **Implementation**: Rescaling is now applied per-key during prevalence lookup (not post-hoc), preserving max aggregation semantics exactly.
 
 **Benefits**:
@@ -70,7 +77,7 @@ This release fixes critical bugs in the Key-LOO implementation and improves perf
 **Files Changed**:
 - `src/molftp_core.cpp`: Modified `build_3view_vectors_batch` to accept scale maps and apply rescaling during lookup
 
-### 3. **train_row_mask Parameter** ✅
+### 4. **train_row_mask Parameter** ✅
 **Implementation**: Added `train_row_mask` parameter to `transform()` method to control which molecules get rescaled.
 
 **Usage**:

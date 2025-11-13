@@ -119,7 +119,7 @@ else:
 
 setup(
     name="molftp",
-    version="1.3.0",
+    version="1.4.0",
     author="MolFTP Contributors",
     author_email="",
     description="Molecular Fragment-Target Prevalence: High-performance feature generation for molecular property prediction",

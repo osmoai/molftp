@@ -2545,11 +2545,12 @@ public:
                         const vector<bool>* train_row_mask = nullptr,
                         const unordered_map<string, double>* scale_1d = nullptr,
                         const unordered_map<string, double>* scale_2d = nullptr,
-                        const unordered_map<string, double>* scale_3d = nullptr) {
+                        const unordered_map<string, double>* scale_3d = nullptr,
+                        int num_threads = 0) {  // FIXED: Add num_threads parameter for OpenMP
         // Use the MEGA-FAST batch version with optional rescaling
         return build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d, 
                                         atom_gate, atom_aggregation, softmax_temperature,
-                                        train_row_mask, scale_1d, scale_2d, scale_3d);
+                                        train_row_mask, scale_1d, scale_2d, scale_3d, num_threads);  // FIXED: Pass num_threads
     }
 
     // LOO-like mode variant (mode: "total" or "influence"). labels are binary 0/1 to compute class totals
@@ -3171,7 +3172,7 @@ public:
             result = build_3view_vectors(
                 smiles, radius,
                 prevalence_data_1d_filtered, prevalence_data_2d_filtered, prevalence_data_3d_filtered,
-                0.0, atom_aggregation
+                0.0, atom_aggregation, 1.0, nullptr, nullptr, nullptr, nullptr, num_threads  // FIXED: Pass num_threads for OpenMP
             );
         } else {
             // Other modes (influence, meanloo, etc.): use mode-aware function

@@ -2279,7 +2279,11 @@ public:
                               const map<string, map<string, double>>& prevalence_data_3d,
                               double atom_gate = 0.0,
                               const string& atom_aggregation = "max",
-                              double softmax_temperature = 1.0) {
+                              double softmax_temperature = 1.0,
+                              const vector<bool>* train_row_mask = nullptr,
+                              const unordered_map<string, double>* scale_1d = nullptr,
+                              const unordered_map<string, double>* scale_2d = nullptr,
+                              const unordered_map<string, double>* scale_3d = nullptr) {
         
         const int n_molecules = smiles.size();
         
@@ -2382,12 +2386,31 @@ public:
                         key_buffer += to_string(depth);
                         key_buffer += ")";
                         
-                        // NUCLEAR-fast: Process all prevalence types inline
+                        // FIXED: Apply exact per-key rescaling for training molecules
+                        // Check if this molecule is training and get per-key scale factors
+                        const bool is_train = train_row_mask && i < (int)train_row_mask->size() && (*train_row_mask)[i];
+                        double s1 = 1.0, s2 = 1.0, s3 = 1.0;
+                        if (is_train) {
+                            if (scale_1d) {
+                                auto it = scale_1d->find(key_buffer);
+                                if (it != scale_1d->end()) s1 = it->second;
+                            }
+                            if (scale_2d) {
+                                auto it = scale_2d->find(key_buffer);
+                                if (it != scale_2d->end()) s2 = it->second;
+                            }
+                            if (scale_3d) {
+                                auto it = scale_3d->find(key_buffer);
+                                if (it != scale_3d->end()) s3 = it->second;
+                            }
+                        }
+                        
+                        // NUCLEAR-fast: Process all prevalence types inline with exact per-key rescaling
                         // 1D prevalence
                         if (pass_map_1d) {
                             auto itP = pass_map_1d->find(key_buffer);
                             if (itP != pass_map_1d->end()) {
-                                double w = itP->second;
+                                double w = itP->second * s1;  // FIXED: Apply per-key rescaling
                                 prevalence_1d[atomIdx] = std::max(prevalence_1d[atomIdx], w);
                                 prevalencer_1d[atomIdx][depth] = std::max(prevalencer_1d[atomIdx][depth], w);
                             }
@@ -2395,7 +2418,7 @@ public:
                         if (fail_map_1d) {
                             auto itF = fail_map_1d->find(key_buffer);
                             if (itF != fail_map_1d->end()) {
-                                double wneg = -itF->second;
+                                double wneg = -(itF->second * s1);  // FIXED: Apply per-key rescaling to magnitude
                                 prevalence_1d[atomIdx] = std::min(prevalence_1d[atomIdx], wneg);
                                 prevalencer_1d[atomIdx][depth] = std::min(prevalencer_1d[atomIdx][depth], wneg);
                             }
@@ -2405,7 +2428,7 @@ public:
                         if (pass_map_2d) {
                             auto itP = pass_map_2d->find(key_buffer);
                             if (itP != pass_map_2d->end()) {
-                                double w = itP->second;
+                                double w = itP->second * s2;  // FIXED: Apply per-key rescaling
                                 prevalence_2d[atomIdx] = std::max(prevalence_2d[atomIdx], w);
                                 prevalencer_2d[atomIdx][depth] = std::max(prevalencer_2d[atomIdx][depth], w);
                             }
@@ -2413,7 +2436,7 @@ public:
                         if (fail_map_2d) {
                             auto itF = fail_map_2d->find(key_buffer);
                             if (itF != fail_map_2d->end()) {
-                                double wneg = -itF->second;
+                                double wneg = -(itF->second * s2);  // FIXED: Apply per-key rescaling to magnitude
                                 prevalence_2d[atomIdx] = std::min(prevalence_2d[atomIdx], wneg);
                                 prevalencer_2d[atomIdx][depth] = std::min(prevalencer_2d[atomIdx][depth], wneg);
                             }
@@ -2423,7 +2446,7 @@ public:
                         if (pass_map_3d) {
                             auto itP = pass_map_3d->find(key_buffer);
                             if (itP != pass_map_3d->end()) {
-                                double w = itP->second;
+                                double w = itP->second * s3;  // FIXED: Apply per-key rescaling
                                 prevalence_3d[atomIdx] = std::max(prevalence_3d[atomIdx], w);
                                 prevalencer_3d[atomIdx][depth] = std::max(prevalencer_3d[atomIdx][depth], w);
                             }
@@ -2431,7 +2454,7 @@ public:
                         if (fail_map_3d) {
                             auto itF = fail_map_3d->find(key_buffer);
                             if (itF != fail_map_3d->end()) {
-                                double wneg = -itF->second;
+                                double wneg = -(itF->second * s3);  // FIXED: Apply per-key rescaling to magnitude
                                 prevalence_3d[atomIdx] = std::min(prevalence_3d[atomIdx], wneg);
                                 prevalencer_3d[atomIdx][depth] = std::min(prevalencer_3d[atomIdx][depth], wneg);
                             }
@@ -2503,9 +2526,15 @@ public:
                         const map<string, map<string, double>>& prevalence_data_3d,
                         double atom_gate = 0.0,
                         const string& atom_aggregation = "max",
-                        double softmax_temperature = 1.0) {
-        // Use the MEGA-FAST batch version
-        return build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
+                        double softmax_temperature = 1.0,
+                        const vector<bool>* train_row_mask = nullptr,
+                        const unordered_map<string, double>* scale_1d = nullptr,
+                        const unordered_map<string, double>* scale_2d = nullptr,
+                        const unordered_map<string, double>* scale_3d = nullptr) {
+        // Use the MEGA-FAST batch version with optional rescaling
+        return build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d, 
+                                        atom_gate, atom_aggregation, softmax_temperature,
+                                        train_row_mask, scale_1d, scale_2d, scale_3d);
     }
 
     // LOO-like mode variant (mode: "total" or "influence"). labels are binary 0/1 to compute class totals
@@ -3226,10 +3255,13 @@ public:
         int k_threshold = 1,
         bool rescale_n_minus_k = false,
         const string& atom_aggregation = "max",
-        double softmax_temperature = 1.0
+        double softmax_temperature = 1.0,
+        double loo_smoothing_tau = 1.0,  // NEW: Smoothing parameter for LOO rescaling
+        const vector<bool>* train_row_mask = nullptr  // NEW: Per-molecule training mask for rescaling
     ) {
         // Create filtered prevalence dictionaries using PRE-COMPUTED counts
         // This ensures vectors are independent of batch size!
+        // NOTE: We filter keys but DON'T rescale here - rescaling is applied per-molecule later
         map<string, map<string, double>> prevalence_data_1d_filtered, prevalence_data_2d_filtered, prevalence_data_3d_filtered;
         
         // Filter 1D prevalence
@@ -3249,10 +3281,8 @@ public:
                 bool keep_key = (mol_count >= k_threshold) && (tot_count >= k_threshold);
                 
                 if (keep_key) {
-                    if (rescale_n_minus_k) {
-                        double rescale_factor = (double)(n_molecules_full - k_threshold + 1) / (double)n_molecules_full;
-                        value *= rescale_factor;
-                    }
+                    // FIXED: Don't rescale here - rescaling is applied per-molecule later based on train_row_mask
+                    // Store the original value and the rescale factor separately
                     prevalence_data_1d_filtered[class_name][key] = value;
                 }
             }
@@ -3274,10 +3304,7 @@ public:
                 bool keep_key = (mol_count >= k_threshold) && (tot_count >= k_threshold);
                 
                 if (keep_key) {
-                    if (rescale_n_minus_k) {
-                        double rescale_factor = (double)(n_molecules_full - k_threshold + 1) / (double)n_molecules_full;
-                        value *= rescale_factor;
-                    }
+                    // FIXED: Don't rescale here - rescaling is applied per-molecule later
                     prevalence_data_2d_filtered[class_name][key] = value;
                 }
             }
@@ -3299,23 +3326,60 @@ public:
                 bool keep_key = (mol_count >= k_threshold) && (tot_count >= k_threshold);
                 
                 if (keep_key) {
-                    if (rescale_n_minus_k) {
-                        double rescale_factor = (double)(n_molecules_full - k_threshold + 1) / (double)n_molecules_full;
-                        value *= rescale_factor;
-                    }
+                    // FIXED: Don't rescale here - rescaling is applied per-molecule later
                     prevalence_data_3d_filtered[class_name][key] = value;
                 }
             }
         }
         
-        // Build vectors using filtered prevalence - simple and stateless!
-        return build_3view_vectors(
+        // FIXED: Precompute per-key scale factors for exact LOO rescaling
+        // This is more accurate than the previous average-factor approximation
+        unordered_map<string, double> scale_1d, scale_2d, scale_3d;
+        const vector<bool>* train_mask_ptr = nullptr;
+        
+        if (rescale_n_minus_k && train_row_mask != nullptr && train_row_mask->size() > 0) {
+            train_mask_ptr = train_row_mask;
+            
+            // Build scale factor maps for each view
+            auto scale_of = [&](int k) { return (k + loo_smoothing_tau - 1.0) / (k + loo_smoothing_tau); };
+            
+            // 1D scale factors
+            for (const auto& [key, mol_count] : key_molecule_count_1d) {
+                if (mol_count >= k_threshold) {
+                    scale_1d[key] = scale_of(mol_count);
+                }
+            }
+            
+            // 2D scale factors (use 1D counts since 2D prevalence uses single keys)
+            for (const auto& [key, mol_count] : key_molecule_count_2d) {
+                if (mol_count >= k_threshold) {
+                    scale_2d[key] = scale_of(mol_count);
+                }
+            }
+            
+            // 3D scale factors (use 1D counts)
+            for (const auto& [key, mol_count] : key_molecule_count_3d) {
+                if (mol_count >= k_threshold) {
+                    scale_3d[key] = scale_of(mol_count);
+                }
+            }
+        }
+        
+        // Build vectors with exact per-key rescaling applied during lookup
+        // This preserves max semantics exactly and avoids the extra motif-extraction pass
+        auto [V1, V2, V3] = build_3view_vectors_batch(
             smiles, radius,
             prevalence_data_1d_filtered, prevalence_data_2d_filtered, prevalence_data_3d_filtered,
             0.0,  // atom_gate
             atom_aggregation,
-            softmax_temperature
+            softmax_temperature,
+            train_mask_ptr,  // Pass train_row_mask for per-molecule check
+            scale_1d.empty() ? nullptr : &scale_1d,  // Pass scale maps if rescaling enabled
+            scale_2d.empty() ? nullptr : &scale_2d,
+            scale_3d.empty() ? nullptr : &scale_3d
         );
+        
+        return make_tuple(V1, V2, V3);
     }
 
     // Molecule-level PASS–FAIL pairs exactly matching Python make_pairs()
@@ -3746,6 +3810,113 @@ public:
         return all_keys;
     }
 
+    // THREADED: Build 2D pair key counts (separate from 1D keys)
+    // Returns (molecule_count_map, total_count_map) for 2D pair keys like "A|B"
+    tuple<map<string, int>, map<string, int>> build_2d_pair_key_counts_threaded(
+        const vector<string>& smiles,
+        int radius,
+        const unordered_set<string>& allowed_pairs,  // Union of prevalence_data_2d_full PASS/FAIL keys
+        int num_threads = 0
+    ) {
+        const int n = smiles.size();
+        
+        // Determine number of threads
+        const int hw = (int)std::thread::hardware_concurrency();
+        const int T = (num_threads > 0) ? num_threads : (hw > 0 ? hw : 4);
+        
+        // Precompute anchors once (shared across threads)
+        auto anchors_cache = build_anchor_cache(smiles, radius);
+        
+        // Thread-local maps
+        vector<map<string, int>> tl_mol(T);
+        vector<map<string, int>> tl_tot(T);
+        
+        // Worker function
+        auto worker = [&](int tid, int start, int end) {
+            for (int i = start; i < end; ++i) {
+                const auto& anchors = anchors_cache[i];
+                
+                // Collect present 1D keys for this molecule
+                vector<pair<string, const vector<int>*>> present;
+                present.reserve(anchors.size());
+                for (const auto& kv : anchors) {
+                    present.emplace_back(kv.first, &kv.second);
+                }
+                
+                // Generate overlapping pairs
+                unordered_set<string> mol_pairs;
+                mol_pairs.reserve(64);
+                
+                for (size_t a = 0; a < present.size(); ++a) {
+                    for (size_t b = a + 1; b < present.size(); ++b) {
+                        // Overlap test (anchors are sorted)
+                        const auto& Sa = *present[a].second;
+                        const auto& Sb = *present[b].second;
+                        
+                        size_t ia = 0, ib = 0;
+                        bool overlap = false;
+                        while (ia < Sa.size() && ib < Sb.size()) {
+                            if (Sa[ia] == Sb[ib]) {
+                                overlap = true;
+                                break;
+                            }
+                            if (Sa[ia] < Sb[ib]) ia++;
+                            else ib++;
+                        }
+                        
+                        if (!overlap) continue;
+                        
+                        // Build pair key (lexicographic order)
+                        const string& A = present[a].first;
+                        const string& B = present[b].first;
+                        string pairKey = (A < B) ? (A + "|" + B) : (B + "|" + A);
+                        
+                        // Only count if it's in allowed_pairs
+                        if (allowed_pairs.find(pairKey) != allowed_pairs.end()) {
+                            mol_pairs.insert(pairKey);
+                        }
+                    }
+                }
+                
+                // Update counts (once per molecule per key)
+                for (const auto& p : mol_pairs) {
+                    tl_mol[tid][p] += 1;  // molecule-level presence
+                    tl_tot[tid][p] += 1;  // same as mol-level here (pairs are binary per molecule)
+                }
+            }
+        };
+        
+        // Launch threads
+        vector<thread> threads;
+        threads.reserve(T);
+        int chunk = (n + T - 1) / T;
+        int s = 0;
+        for (int t = 0; t < T; ++t) {
+            int e = min(n, s + chunk);
+            if (s >= e) break;
+            threads.emplace_back(worker, t, s, e);
+            s = e;
+        }
+        
+        // Wait for completion
+        for (auto& th : threads) th.join();
+        
+        // Merge thread-local maps
+        map<string, int> mol_count;
+        map<string, int> tot_count;
+        
+        for (int t = 0; t < (int)threads.size(); ++t) {
+            for (const auto& kv : tl_mol[t]) {
+                mol_count[kv.first] += kv.second;
+            }
+            for (const auto& kv : tl_tot[t]) {
+                tot_count[kv.first] += kv.second;
+            }
+        }
+        
+        return {mol_count, tot_count};
+    }
+
     // THREADED: build_1d_ftp_stats - Parallel key extraction and counting
     map<string, double> build_1d_ftp_stats_threaded(
         const vector<string>& smiles, 
@@ -4022,11 +4193,15 @@ private:
     vector<map<string, map<string, double>>> prevalence_data_3d_per_task_;
     
     // Key-LOO: Store key counts per task (counted on measured molecules only!)
-    vector<map<string, int>> key_molecule_count_per_task_;
-    vector<map<string, int>> key_total_count_per_task_;
+    vector<map<string, int>> key_molecule_count_per_task_;  // 1D keys
+    vector<map<string, int>> key_total_count_per_task_;      // 1D keys
+    vector<map<string, int>> key_molecule_count_2d_per_task_;  // NEW: 2D pair keys
+    vector<map<string, int>> key_total_count_2d_per_task_;     // NEW: 2D pair keys
     vector<int> n_measured_per_task_;  // Number of measured molecules per task
-    int k_threshold_;  // Key-LOO threshold (default: 2, matching Python)
+    int k_threshold_;  // Key-LOO threshold (default: 1, keeps all keys)
     bool use_key_loo_;  // NEW: Enable/disable Key-LOO filtering (true=Key-LOO, false=Dummy-Masking)
+    bool verbose_;  // NEW: Enable/disable verbose output
+    double loo_smoothing_tau_;  // NEW: Smoothing parameter for LOO rescaling (tau in (k_j-1+tau)/(k_j+tau))
     
     bool is_fitted_;
     
@@ -4049,11 +4224,15 @@ public:
         double alpha = 0.5,
         int num_threads = 0,
         CountingMethod counting_method = CountingMethod::COUNTING,
-        bool use_key_loo = true  // NEW: Enable/disable Key-LOO filtering
+        bool use_key_loo = true,  // NEW: Enable/disable Key-LOO filtering
+        bool verbose = true,  // NEW: Enable/disable verbose output
+        int k_threshold = 1,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=1 keeps all keys
+        double loo_smoothing_tau = 1.0  // NEW: Smoothing parameter for LOO rescaling. tau=1.0 means singletons get factor 0.5 instead of 0
     ) : radius_(radius), nBits_(nBits), sim_thresh_(sim_thresh),
         stat_1d_(stat_1d), stat_2d_(stat_2d), stat_3d_(stat_3d),
         alpha_(alpha), num_threads_(num_threads), counting_method_(counting_method),
-        k_threshold_(2), use_key_loo_(use_key_loo), is_fitted_(false) {}  // Fix initialization order
+        k_threshold_(k_threshold), use_key_loo_(use_key_loo), verbose_(verbose), 
+        loo_smoothing_tau_(loo_smoothing_tau), is_fitted_(false) {}  // Fix initialization order
     
     // Build prevalence for all tasks
     void fit(
@@ -4085,22 +4264,28 @@ public:
         prevalence_data_3d_per_task_.resize(n_tasks_);
         key_molecule_count_per_task_.resize(n_tasks_);
         key_total_count_per_task_.resize(n_tasks_);
+        key_molecule_count_2d_per_task_.resize(n_tasks_);  // NEW: Separate 2D counts
+        key_total_count_2d_per_task_.resize(n_tasks_);     // NEW: Separate 2D counts
         n_measured_per_task_.resize(n_tasks_);
         
-        cout << "\n" << string(80, '=') << "\n";
-        cout << "BUILDING MULTI-TASK PREVALENCE (C++)\n";
-        cout << string(80, '=') << "\n";
-        cout << "Number of tasks: " << n_tasks_ << "\n";
-        cout << "Total molecules: " << n_molecules << "\n";
-        cout << "Radius: " << radius_ << "\n";
-        cout << "Threads: " << num_threads_ << "\n";
-        cout << string(80, '=') << "\n";
+        if (verbose_) {
+            cout << "\n" << string(80, '=') << "\n";
+            cout << "BUILDING MULTI-TASK PREVALENCE (C++)\n";
+            cout << string(80, '=') << "\n";
+            cout << "Number of tasks: " << n_tasks_ << "\n";
+            cout << "Total molecules: " << n_molecules << "\n";
+            cout << "Radius: " << radius_ << "\n";
+            cout << "Threads: " << num_threads_ << "\n";
+            cout << string(80, '=') << "\n";
+        }
         
         // Build each task's prevalence sequentially (Python wrapper will handle threading)
         for (int task_idx = 0; task_idx < n_tasks_; task_idx++) {
-            cout << "\n" << string(80, '=') << "\n";
-            cout << "Task " << (task_idx+1) << "/" << n_tasks_ << ": " << task_names[task_idx] << "\n";
-            cout << string(80, '=') << "\n";
+            if (verbose_) {
+                cout << "\n" << string(80, '=') << "\n";
+                cout << "Task " << (task_idx+1) << "/" << n_tasks_ << ": " << task_names[task_idx] << "\n";
+                cout << string(80, '=') << "\n";
+            }
             
             // Extract non-NaN samples for this task
             vector<string> smiles_task;
@@ -4195,6 +4380,8 @@ public:
             // Key-LOO: Count keys on measured molecules only (ONLY if use_key_loo_ is true!)
             if (use_key_loo_) {
                 cout << "  Counting keys for Key-LOO filtering...\n";
+                
+                // Count 1D keys
                 auto all_keys = task_generators_[task_idx].get_all_motif_keys_batch_threaded(
                     smiles_task, radius_, num_threads_
                 );
@@ -4215,12 +4402,24 @@ public:
                 
                 key_molecule_count_per_task_[task_idx] = key_mol_count;
                 key_total_count_per_task_[task_idx] = key_tot_count;
+                
+                // FIXED: 2D prevalence uses SINGLE keys (not pair keys), so use 1D counts for 2D filtering
+                // build_2d_ftp_stats builds prevalence using single keys like "(bit, depth)" that are discordant
+                // between PASS-FAIL molecule pairs, not pair keys like "A|B"
+                cout << "  Using 1D key counts for 2D filtering (2D prevalence uses single keys)...\n";
+                
+                // Reuse 1D counts for 2D (they're the same keys!)
+                key_molecule_count_2d_per_task_[task_idx] = key_molecule_count_per_task_[task_idx];
+                key_total_count_2d_per_task_[task_idx] = key_total_count_per_task_[task_idx];
+                
                 n_measured_per_task_[task_idx] = n_measured;
             } else {
                 cout << "  Skipping Key-LOO filtering (Dummy-Masking mode)...\n";
                 // For Dummy-Masking: No Key-LOO, so leave counts empty
                 key_molecule_count_per_task_[task_idx] = {};
                 key_total_count_per_task_[task_idx] = {};
+                key_molecule_count_2d_per_task_[task_idx] = {};
+                key_total_count_2d_per_task_[task_idx] = {};
                 n_measured_per_task_[task_idx] = 0;  // Not used in Dummy-Masking
             }
             
@@ -4238,8 +4437,42 @@ public:
         cout << string(80, '=') << "\n";
     }
     
+    // Wrapper for Python: accepts optional train_row_mask as Python list/array
+    py::array_t<double> transform_py(const vector<string>& smiles, 
+                                       py::object train_row_mask_py = py::none()) {
+        vector<bool>* train_row_mask_ptr = nullptr;
+        vector<bool> train_row_mask_local;
+        
+        // Convert Python train_row_mask to C++ vector<bool> if provided
+        if (!train_row_mask_py.is_none()) {
+            try {
+                // Try to convert from various Python types
+                if (py::isinstance<py::list>(train_row_mask_py)) {
+                    py::list mask_list = train_row_mask_py.cast<py::list>();
+                    train_row_mask_local.reserve(mask_list.size());
+                    for (size_t i = 0; i < mask_list.size(); i++) {
+                        train_row_mask_local.push_back(mask_list[i].cast<bool>());
+                    }
+                } else if (py::isinstance<py::array>(train_row_mask_py)) {
+                    py::array_t<bool> mask_array = train_row_mask_py.cast<py::array_t<bool>>();
+                    auto buf = mask_array.request();
+                    bool* ptr = static_cast<bool*>(buf.ptr);
+                    train_row_mask_local.assign(ptr, ptr + buf.size);
+                } else {
+                    throw runtime_error("train_row_mask must be a list or numpy array of booleans");
+                }
+                train_row_mask_ptr = &train_row_mask_local;
+            } catch (...) {
+                throw runtime_error("Failed to convert train_row_mask to vector<bool>");
+            }
+        }
+        
+        return transform(smiles, train_row_mask_ptr);
+    }
+    
     // Transform: compute fragments once, generate features for all tasks
-    py::array_t<double> transform(const vector<string>& smiles) {
+    py::array_t<double> transform(const vector<string>& smiles, 
+                                   const vector<bool>* train_row_mask = nullptr) {
         if (!is_fitted_) {
             throw runtime_error("Must call fit() first");
         }
@@ -4248,11 +4481,28 @@ public:
         int features_per_task = get_features_per_task();
         int n_features_total = n_tasks_ * features_per_task;
         
+        // FIXED: Determine if we should apply Key-LOO rescaling
+        // Rescaling should ONLY be applied to training molecules, never at inference
+        bool apply_key_loo_rescaling = false;
+        if (use_key_loo_ && train_row_mask != nullptr) {
+            // Check if any rows are marked as training
+            for (size_t i = 0; i < train_row_mask->size() && i < (size_t)n_molecules; i++) {
+                if ((*train_row_mask)[i]) {
+                    apply_key_loo_rescaling = true;
+                    break;
+                }
+            }
+        }
+        // If train_row_mask is nullptr or all false, this is inference → no rescaling
+        
         cout << "\n" << string(80, '=') << "\n";
         cout << "TRANSFORMING TO MULTI-TASK FEATURES (C++)\n";
         cout << string(80, '=') << "\n";
         cout << "Molecules: " << n_molecules << "\n";
         cout << "Total features: " << n_features_total << "\n";
+        if (use_key_loo_) {
+            cout << "Key-LOO rescaling: " << (apply_key_loo_rescaling ? "YES (training)" : "NO (inference)") << "\n";
+        }
         
         // Allocate output array
         py::array_t<double> result({n_molecules, n_features_total});
@@ -4269,22 +4519,26 @@ public:
             
             if (use_key_loo_) {
                 // Key-LOO: Filter keys based on occurrence counts
+                // FIXED: Only apply rescaling for training molecules, never at inference
+                // FIXED: Use separate 2D counts (not 1D counts!)
                 result_tuple = task_generators_[task_idx].build_vectors_with_key_loo_fixed(
                     smiles, radius_,
                     prevalence_data_1d_per_task_[task_idx],
                     prevalence_data_2d_per_task_[task_idx],
                     prevalence_data_3d_per_task_[task_idx],
-                    key_molecule_count_per_task_[task_idx],
-                    key_total_count_per_task_[task_idx],
-                    key_molecule_count_per_task_[task_idx],
-                    key_total_count_per_task_[task_idx],
-                    key_molecule_count_per_task_[task_idx],
-                    key_total_count_per_task_[task_idx],
+                    key_molecule_count_per_task_[task_idx],      // 1D counts
+                    key_total_count_per_task_[task_idx],          // 1D counts
+                    key_molecule_count_2d_per_task_[task_idx],   // FIXED: 2D uses 1D counts (2D prevalence uses single keys!)
+                    key_total_count_2d_per_task_[task_idx],      // FIXED: 2D uses 1D counts (2D prevalence uses single keys!)
+                    key_molecule_count_per_task_[task_idx],      // 3D uses 1D counts (by design)
+                    key_total_count_per_task_[task_idx],          // 3D uses 1D counts (by design)
                     n_measured_per_task_[task_idx],
                     k_threshold_,
-                    true,  // rescale_n_minus_k
+                    apply_key_loo_rescaling,  // FIXED: Only true for training, false for inference
                     "max",  // FIXED: Match Python PrevalenceGenerator default
-                    1.0
+                    1.0,
+                    loo_smoothing_tau_,  // NEW: Smoothed LOO rescaling (tau=1.0 prevents singleton zeroing)
+                    train_row_mask  // NEW: Per-molecule training mask for rescaling
                 );
             } else {
                 // Dummy-Masking: Simple prevalence, NO Key-LOO filtering!
@@ -4305,7 +4559,9 @@ public:
                     0,  // k_threshold = 0 (disabled)
                     false,  // rescale_n_minus_k = false (no rescaling)
                     "max",  // FIXED: Match Python PrevalenceGenerator default
-                    1.0
+                    1.0,
+                    loo_smoothing_tau_,  // Not used when rescaling is disabled, but keep for consistency
+                    nullptr  // train_row_mask = nullptr (no rescaling for Dummy-Masking)
                 );
             }
             
@@ -4463,20 +4719,29 @@ public:
             prevalence_data_3d_per_task_,
             key_molecule_count_per_task_,
             key_total_count_per_task_,
+            key_molecule_count_2d_per_task_,  // NEW: 2D counts
+            key_total_count_2d_per_task_,     // NEW: 2D counts
             n_measured_per_task_,
             k_threshold_,
             use_key_loo_,
+            verbose_,
+            loo_smoothing_tau_,  // NEW: Include smoothing parameter
             is_fitted_
         );
     }
     
     // Pickle support: __setstate__
     void __setstate__(py::tuple t) {
-        if (t.size() != 20) {
+        // Read n_tasks_ first (needed for backward compatibility check)
+        n_tasks_ = t[0].cast<int>();
+        
+        // Updated size: was 21, now 24 (added 2D counts + loo_smoothing_tau)
+        // Old formats: 21 (original), 23 (with 2D counts)
+        bool is_old_format_21 = (t.size() == 21);
+        bool is_old_format_23 = (t.size() == 23);
+        if (t.size() != 24 && !is_old_format_21 && !is_old_format_23) {
             throw std::runtime_error("Invalid state for MultiTaskPrevalenceGenerator!");
         }
-        
-        n_tasks_ = t[0].cast<int>();
         radius_ = t[1].cast<int>();
         nBits_ = t[2].cast<int>();
         sim_thresh_ = t[3].cast<double>();
@@ -4492,10 +4757,42 @@ public:
         prevalence_data_3d_per_task_ = t[13].cast<vector<map<string, map<string, double>>>>();
         key_molecule_count_per_task_ = t[14].cast<vector<map<string, int>>>();
         key_total_count_per_task_ = t[15].cast<vector<map<string, int>>>();
-        n_measured_per_task_ = t[16].cast<vector<int>>();
-        k_threshold_ = t[17].cast<int>();
-        use_key_loo_ = t[18].cast<bool>();
-        is_fitted_ = t[19].cast<bool>();
+        
+        if (is_old_format_21) {
+            // Old format (21 items) - initialize 2D counts as empty, use default tau=1.0
+            key_molecule_count_2d_per_task_.resize(n_tasks_);
+            key_total_count_2d_per_task_.resize(n_tasks_);
+            for (int i = 0; i < n_tasks_; i++) {
+                key_molecule_count_2d_per_task_[i] = {};
+                key_total_count_2d_per_task_[i] = {};
+            }
+            n_measured_per_task_ = t[16].cast<vector<int>>();
+            k_threshold_ = t[17].cast<int>();
+            use_key_loo_ = t[18].cast<bool>();
+            verbose_ = t[19].cast<bool>();
+            loo_smoothing_tau_ = 1.0;  // Default value
+            is_fitted_ = t[20].cast<bool>();
+        } else if (is_old_format_23) {
+            // Format with 2D counts but no loo_smoothing_tau
+            key_molecule_count_2d_per_task_ = t[16].cast<vector<map<string, int>>>();
+            key_total_count_2d_per_task_ = t[17].cast<vector<map<string, int>>>();
+            n_measured_per_task_ = t[18].cast<vector<int>>();
+            k_threshold_ = t[19].cast<int>();
+            use_key_loo_ = t[20].cast<bool>();
+            verbose_ = t[21].cast<bool>();
+            loo_smoothing_tau_ = 1.0;  // Default value
+            is_fitted_ = t[22].cast<bool>();
+        } else {
+            // New format (24 items) with 2D counts + loo_smoothing_tau
+            key_molecule_count_2d_per_task_ = t[16].cast<vector<map<string, int>>>();
+            key_total_count_2d_per_task_ = t[17].cast<vector<map<string, int>>>();
+            n_measured_per_task_ = t[18].cast<vector<int>>();
+            k_threshold_ = t[19].cast<int>();
+            use_key_loo_ = t[20].cast<bool>();
+            verbose_ = t[21].cast<bool>();
+            loo_smoothing_tau_ = t[22].cast<double>();
+            is_fitted_ = t[23].cast<bool>();
+        }
         
         // Reconstruct task_generators_ (they don't need to store state, just need to exist)
         task_generators_.clear();
@@ -4549,7 +4846,9 @@ PYBIND11_MODULE(_molftp, m) {
         .def("build_3view_vectors_batch", &VectorizedFTPGenerator::build_3view_vectors_batch,
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
-             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
+             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
+             py::arg("train_row_mask") = py::none(), py::arg("scale_1d") = py::none(), 
+             py::arg("scale_2d") = py::none(), py::arg("scale_3d") = py::none())
         .def("generate_ftp_vector", &VectorizedFTPGenerator::generate_ftp_vector,
              py::arg("smiles"), py::arg("radius"), py::arg("prevalence_data"), py::arg("atom_gate") = 0.0, 
              py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
@@ -4604,6 +4903,8 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("n_molecules_full"),
              py::arg("k_threshold") = 1, py::arg("rescale_n_minus_k") = false, 
              py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
+             py::arg("loo_smoothing_tau") = 1.0,  // NEW: Smoothing parameter for LOO rescaling
+             py::arg("train_row_mask") = py::none(),  // NEW: Per-molecule training mask for rescaling
              "Fixed Key-LOO that works for inference on new data (batch-independent)")
         .def("build_vectors_with_efficient_key_loo", &VectorizedFTPGenerator::build_vectors_with_efficient_key_loo,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
@@ -4632,7 +4933,7 @@ PYBIND11_MODULE(_molftp, m) {
     
     // Multi-Task Prevalence Generator bindings
     py::class_<MultiTaskPrevalenceGenerator>(m, "MultiTaskPrevalenceGenerator")
-        .def(py::init<int, int, double, string, string, string, double, int, CountingMethod, bool>(),
+        .def(py::init<int, int, double, string, string, string, double, int, CountingMethod, bool, bool, int, double>(),
              py::arg("radius") = 6,
              py::arg("nBits") = 2048,
              py::arg("sim_thresh") = 0.5,
@@ -4643,16 +4944,24 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("num_threads") = 0,
              py::arg("counting_method") = CountingMethod::COUNTING,
              py::arg("use_key_loo") = true,  // NEW: Enable/disable Key-LOO (true=Key-LOO, false=Dummy-Masking)
+             py::arg("verbose") = false,  // NEW: Enable/disable verbose output
+             py::arg("k_threshold") = 1,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=1 keeps all keys
+             py::arg("loo_smoothing_tau") = 1.0,  // NEW: Smoothing parameter for LOO rescaling (tau=1.0 prevents singleton zeroing)
              "Initialize Multi-Task Prevalence Generator\n"
              "use_key_loo=True: Key-LOO filtering (for Key-LOO multi-task)\n"
-             "use_key_loo=False: Simple prevalence, no filtering (for Dummy-Masking)")
+             "use_key_loo=False: Simple prevalence, no filtering (for Dummy-Masking)\n"
+             "verbose=True: Print progress messages\n"
+             "verbose=False: Silent mode (for performance)")
         .def("fit", &MultiTaskPrevalenceGenerator::fit,
              py::arg("smiles"), py::arg("Y_sparse"), py::arg("task_names"),
              "Build task-specific prevalence for all tasks (Y_sparse: 2D NumPy array with NaN)")
-        .def("transform", &MultiTaskPrevalenceGenerator::transform,
-             py::arg("smiles"),
+        .def("transform", &MultiTaskPrevalenceGenerator::transform_py,
+             py::arg("smiles"), py::arg("train_row_mask") = py::none(),
              "Transform molecules to multi-task features (returns 2D NumPy array)\n"
-             "For Key-LOO: Uses k-threshold filtering\n"
+             "For Key-LOO: Uses k-threshold filtering with per-key (k_j-1)/k_j rescaling\n"
+             "  - train_row_mask: Optional list/array of booleans indicating training molecules\n"
+             "  - If train_row_mask provided: Apply Key-LOO rescaling to training molecules only\n"
+             "  - If train_row_mask=None: No rescaling (inference mode)\n"
              "For simple: No filtering (use_key_loo=False in constructor)")
         .def("transform_with_dummy_masking", &MultiTaskPrevalenceGenerator::transform_with_dummy_masking,
              py::arg("smiles"), py::arg("train_indices_per_task"),

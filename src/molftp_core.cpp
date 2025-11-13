@@ -60,6 +60,13 @@ private:
     int max_triplets;
     CountingMethod counting_method;
     
+    // ---------- Phase 2: Fingerprint caching ----------
+    struct FPView {
+        vector<int> on;  // on-bits
+        int pop;         // popcount
+    };
+    vector<FPView> fp_global_;  // Global fingerprint cache
+    
     // ---------- Packed motif key helpers (cut string churn) ----------
     static inline uint64_t pack_key(uint32_t bit, uint32_t depth) {
         return (uint64_t(bit) << 8) | (uint64_t(depth) & 0xFFu);
@@ -80,6 +87,55 @@ private:
         // Map POSITION -> original index in 'smiles'
         vector<int> pos2idx;                      // size M
     };
+    
+    // ---------- Phase 2: Build global fingerprint cache ----------
+    void build_fp_cache_global_(const vector<string>& smiles, int fp_radius) {
+        fp_global_.clear();
+        fp_global_.resize(smiles.size());
+        for (size_t i = 0; i < smiles.size(); ++i) {
+            ROMol* m = nullptr;
+            try { m = SmilesToMol(smiles[i]); } catch (...) { m = nullptr; }
+            if (!m) { fp_global_[i].pop = 0; continue; }
+            unique_ptr<ExplicitBitVect> fp(MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits));
+            delete m;
+            if (!fp) { fp_global_[i].pop = 0; continue; }
+            vector<int> tmp;
+            fp->getOnBits(tmp);
+            fp_global_[i].pop = (int)tmp.size();
+            fp_global_[i].on = tmp;
+        }
+    }
+    
+    // ---------- Phase 2: Build postings from cache ----------
+    PostingsIndex build_postings_from_cache_(const vector<FPView>& cache, const vector<int>& subset, bool build_lists) {
+        PostingsIndex ix;
+        ix.nBits = nBits;
+        if (build_lists) {
+            ix.lists.assign(ix.nBits, {});
+        }
+        ix.pop.resize(subset.size());
+        ix.onbits.resize(subset.size());
+        ix.pos2idx = subset;
+        
+        for (size_t p = 0; p < subset.size(); ++p) {
+            int j = subset[p];
+            if (j < 0 || j >= (int)cache.size() || cache[j].pop == 0) {
+                ix.pop[p] = 0;
+                continue;
+            }
+            const auto& fp = cache[j];
+            ix.pop[p] = fp.pop;
+            ix.onbits[p] = fp.on;
+            if (build_lists) {
+                for (int b : fp.on) {
+                    if (b >= 0 && b < ix.nBits) {
+                        ix.lists[b].push_back((int)p);
+                    }
+                }
+            }
+        }
+        return ix;
+    }
     
     // Build postings for a subset of rows (e.g., FAIL or PASS)
     PostingsIndex build_postings_index_(const vector<string>& smiles,
@@ -102,13 +158,14 @@ private:
             delete m;
             if (!fp) { ix.pop[p] = 0; continue; }
             // Collect on bits once
-            vector<unsigned int> tmp;
+            vector<int> tmp;
             fp->getOnBits(tmp);
             ix.pop[p] = (int)tmp.size();
-            ix.onbits[p].reserve(tmp.size());
-            for (auto b : tmp) {
-                ix.onbits[p].push_back((int)b);
-                ix.lists[b].push_back((int)p); // postings carry POSITION (0..M-1)
+            ix.onbits[p] = tmp;
+            for (int b : tmp) {
+                if (b >= 0 && b < ix.nBits) {
+                    ix.lists[b].push_back((int)p); // postings carry POSITION (0..M-1)
+                }
             }
         }
         return ix;
@@ -165,10 +222,9 @@ private:
     
     // Extract anchor on-bits + popcount once
     static inline void get_onbits_and_pop_(const ExplicitBitVect& fp, vector<int>& onbits, int& pop) {
-        vector<unsigned int> tmp;
+        vector<int> tmp;
         fp.getOnBits(tmp);
-        onbits.resize(tmp.size());
-        for (size_t i=0;i<tmp.size();++i) onbits[i] = (int)tmp[i];
+        onbits = tmp;
         pop = (int)tmp.size();
     }
     

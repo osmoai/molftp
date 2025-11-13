@@ -1,7 +1,4 @@
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
-#include <pybind11/stl.h>
-#include <pybind11/iostream.h>
+// Standard library headers first
 #include <iostream>
 #include <vector>
 #include <map>
@@ -16,10 +13,17 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+#include <numeric>
+#include <climits>
+#include <cstdlib>
 
+// Include system Python.h FIRST to establish Python API
+// This prevents pybind11 from including Python.h through RDKit
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+// RDKit headers (these include Boost.Python via rdkit/Python.h)
+// But system Python.h is already included, so Boost.Python will use it
 #include <RDGeneral/export.h>
 #include <GraphMol/RDKitBase.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
@@ -27,6 +31,13 @@
 #include <DataStructs/BitOps.h>
 #include <DataStructs/ExplicitBitVect.h>
 #include <DataStructs/BitVect.h>
+
+// pybind11 headers last (system Python.h already included)
+// PYBIND11_SIMPLE_GIL_MANAGEMENT is defined in setup.py to avoid conflicts
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+#include <pybind11/iostream.h>
 
 using namespace RDKit;
 using namespace std;
@@ -48,6 +59,179 @@ private:
     int max_pairs;
     int max_triplets;
     CountingMethod counting_method;
+    
+    // ---------- Phase 2: Fingerprint caching ----------
+    struct FPView {
+        vector<int> on;  // on-bits
+        int pop;         // popcount
+    };
+    vector<FPView> fp_global_;  // Global fingerprint cache
+    
+    // ---------- Packed motif key helpers (cut string churn) ----------
+    static inline uint64_t pack_key(uint32_t bit, uint32_t depth) {
+        return (uint64_t(bit) << 8) | (uint64_t(depth) & 0xFFu);
+    }
+    static inline void unpack_key(uint64_t p, uint32_t &bit, uint32_t &depth) {
+        depth = uint32_t(p & 0xFFu);
+        bit   = uint32_t(p >> 8);
+    }
+    
+    // ---------- Postings index for indexed neighbor search ----------
+    struct PostingsIndex {
+        int nBits = 2048;
+        // bit -> list of POSITION (0..M-1) of molecules in the subset
+        vector<vector<int>> lists;
+        // Per-position caches for the subset
+        vector<int> pop;                          // popcount b
+        vector<vector<int>> onbits;               // on-bits per molecule (positions)
+        // Map POSITION -> original index in 'smiles'
+        vector<int> pos2idx;                      // size M
+    };
+    
+    // ---------- Phase 2: Build global fingerprint cache ----------
+    void build_fp_cache_global_(const vector<string>& smiles, int fp_radius) {
+        fp_global_.clear();
+        fp_global_.resize(smiles.size());
+        for (size_t i = 0; i < smiles.size(); ++i) {
+            ROMol* m = nullptr;
+            try { m = SmilesToMol(smiles[i]); } catch (...) { m = nullptr; }
+            if (!m) { fp_global_[i].pop = 0; continue; }
+            unique_ptr<ExplicitBitVect> fp(MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits));
+            delete m;
+            if (!fp) { fp_global_[i].pop = 0; continue; }
+            vector<int> tmp;
+            fp->getOnBits(tmp);
+            fp_global_[i].pop = (int)tmp.size();
+            fp_global_[i].on = tmp;
+        }
+    }
+    
+    // ---------- Phase 2: Build postings from cache ----------
+    PostingsIndex build_postings_from_cache_(const vector<FPView>& cache, const vector<int>& subset, bool build_lists) {
+        PostingsIndex ix;
+        ix.nBits = nBits;
+        if (build_lists) {
+            ix.lists.assign(ix.nBits, {});
+        }
+        ix.pop.resize(subset.size());
+        ix.onbits.resize(subset.size());
+        ix.pos2idx = subset;
+        
+        for (size_t p = 0; p < subset.size(); ++p) {
+            int j = subset[p];
+            if (j < 0 || j >= (int)cache.size() || cache[j].pop == 0) {
+                ix.pop[p] = 0;
+                continue;
+            }
+            const auto& fp = cache[j];
+            ix.pop[p] = fp.pop;
+            ix.onbits[p] = fp.on;
+            if (build_lists) {
+                for (int b : fp.on) {
+                    if (b >= 0 && b < ix.nBits) {
+                        ix.lists[b].push_back((int)p);
+                    }
+                }
+            }
+        }
+        return ix;
+    }
+    
+    // Build postings for a subset of rows (e.g., FAIL or PASS)
+    PostingsIndex build_postings_index_(const vector<string>& smiles,
+                                        const vector<int>& subset,
+                                        int fp_radius) {
+        PostingsIndex ix;
+        ix.nBits = nBits;
+        ix.lists.assign(ix.nBits, {});
+        ix.pop.resize(subset.size());
+        ix.onbits.resize(subset.size());
+        ix.pos2idx = subset;
+        
+        // Precompute on-bits and popcounts, fill postings
+        for (size_t p = 0; p < subset.size(); ++p) {
+            int j = subset[p];
+            ROMol* m = nullptr;
+            try { m = SmilesToMol(smiles[j]); } catch (...) { m = nullptr; }
+            if (!m) { ix.pop[p] = 0; continue; }
+            unique_ptr<ExplicitBitVect> fp(MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits));
+            delete m;
+            if (!fp) { ix.pop[p] = 0; continue; }
+            // Collect on bits once
+            vector<int> tmp;
+            fp->getOnBits(tmp);
+            ix.pop[p] = (int)tmp.size();
+            ix.onbits[p] = tmp;
+            for (int b : tmp) {
+                if (b >= 0 && b < ix.nBits) {
+                    ix.lists[b].push_back((int)p); // postings carry POSITION (0..M-1)
+                }
+            }
+        }
+        return ix;
+    }
+    
+    // Compute best neighbor of anchor against an index (FAIL or PASS), with c-lower-bound pruning.
+    // Returns (bestPosInSubset, bestSim), or (-1, -1.0) if none passes threshold.
+    struct BestResult { int pos=-1; double sim=-1.0; };
+    BestResult argmax_neighbor_indexed_(
+        const vector<int>& anchor_onbits,
+        int a_pop,
+        const PostingsIndex& ix,
+        double thresh,
+        // thread-local accumulators:
+        vector<int>& acc_count,         // size = ix.pop.size()
+        vector<int>& last_seen,         // size = ix.pop.size()
+        vector<int>& touched,           // list of positions touched in this call
+        int epoch
+    ) {
+        touched.clear();
+        // Accumulate exact common bits 'c' for candidates that share at least one anchor bit
+        for (int b : anchor_onbits) {
+            if (b < 0 || b >= ix.nBits) continue;
+            const auto& plist = ix.lists[b];
+            for (int pos : plist) {
+                if (last_seen[pos] != epoch) {
+                    last_seen[pos] = epoch;
+                    acc_count[pos] = 1;
+                    touched.push_back(pos);
+                } else {
+                    acc_count[pos] += 1;
+                }
+            }
+        }
+        BestResult best;
+        const double one_plus_t = 1.0 + thresh;
+        // Evaluate only touched candidates
+        for (int pos : touched) {
+            int c = acc_count[pos];
+            int b_pop = ix.pop[pos];
+            // Necessary lower bound on common bits to reach 'thresh':
+            // c >= ceil( t * (a + b) / (1 + t) )
+            int cmin = (int)ceil( (thresh * (a_pop + b_pop)) / one_plus_t );
+            if (c < cmin) continue;
+            // Exact Tanimoto via counts, no bit ops needed:
+            double T = double(c) / double(a_pop + b_pop - c);
+            if (T >= thresh && T > best.sim) {
+                best.sim = T;
+                best.pos = pos;
+            }
+        }
+        return best;
+    }
+    
+    // Extract anchor on-bits + popcount once
+    static inline void get_onbits_and_pop_(const ExplicitBitVect& fp, vector<int>& onbits, int& pop) {
+        vector<int> tmp;
+        fp.getOnBits(tmp);
+        onbits = tmp;
+        pop = (int)tmp.size();
+    }
+    
+    // Check if legacy scan should be forced
+    static inline bool force_legacy_scan_() {
+        return std::getenv("MOLFTP_FORCE_LEGACY_SCAN") != nullptr;
+    }
     
     // helpers for exact binomial tails at p=0.5
     static double log_comb(int n, int k) {
@@ -2250,155 +2434,118 @@ public:
                                                                const vector<int>& labels,
                                                                int fp_radius=2,
                                                                int nBits_local=2048,
-                                                               double sim_thresh_local=0.85,
-                                                               int num_threads=0) {  // PERF: Add num_threads parameter
+                                                               double sim_thresh_local=0.85) {
         const int n = (int)smiles.size();
-        vector<int> idx(n); iota(idx.begin(), idx.end(), 0);
-        
-        // PERF: Precompute FPS once (can be parallelized but usually fast)
-        vector<ExplicitBitVect*> fps; fps.reserve(n);
-        for (int i=0;i<n;++i){ ROMol* m=nullptr; try{ m=SmilesToMol(smiles[i]); }catch(...){ m=nullptr; }
-            fps.push_back(m? MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits_local):nullptr);
-            if (m) delete m; }
-        
-        // PERF: Thread-safe triplets collection
-        vector<tuple<int,int,int,double,double>> trips;
-        mutex trips_mutex;
-        
-        // PERF: Determine thread count
-        const int hw = (int)std::thread::hardware_concurrency();
-        int T = 1;
-        if (num_threads > 0) {
-            T = num_threads;
-        } else if (num_threads == -1) {
-            T = (hw > 0) ? hw : 1;
-        } else if (num_threads == 0) {
-            T = (hw > 0) ? hw : 1;
-        }
-        
-        // PERF: Parallelize anchor loop
-        if (T > 1 && n > 1) {
-            py::gil_scoped_release nogil;
-            
-            vector<thread> threads;
-            threads.reserve(T);
-            
-            auto worker = [&](int start, int end) {
-                vector<tuple<int,int,int,double,double>> local_trips;
-                local_trips.reserve((end - start) / 2);  // Estimate
-                
-                for (int i=start; i<end; ++i) {
-                    if (!fps[i]) continue;
-                    
-                    // PERF: Compute similarities to all molecules (this is the expensive part)
-                    vector<double> sims(n, -1.0);
-                    for (int j=0;j<n;++j){ 
-                        if (!fps[j]) continue; 
-                        sims[j] = (i==j)? -1.0 : TanimotoSimilarity(*fps[i], *fps[j]); 
-                    }
-                    
-                    // argmax in each class
-                    int iP=-1, iF=-1; double sP=-1.0, sF=-1.0;
-                    for (int j=0;j<n;++j){ 
-                        if (j==i || !fps[j]) continue; 
-                        double s=sims[j];
-                        if (labels[j]==1){ if (s>sP){ sP=s; iP=j; } }
-                        else { if (s>sF){ sF=s; iF=j; } }
-                    }
-                    if (iP>=0 && iF>=0 && sP>=sim_thresh_local && sF>=sim_thresh_local){ 
-                        local_trips.emplace_back(i, iP, iF, sP, sF); 
-                    }
-                }
-                
-                // Merge local triplets (thread-safe)
-                if (!local_trips.empty()) {
-                    lock_guard<mutex> lock(trips_mutex);
-                    trips.insert(trips.end(), local_trips.begin(), local_trips.end());
-                }
-            };
-            
-            int chunk = (n + T - 1) / T;
-            int s = 0;
-            for (int t = 0; t < T; ++t) {
-                int e = min(n, s + chunk);
-                if (s >= e) break;
-                threads.emplace_back(worker, s, e);
-                s = e;
+        vector<int> idxP, idxF; idxP.reserve(n); idxF.reserve(n);
+        for (int i=0;i<n;++i) ((labels[i]==1)? idxP:idxF).push_back(i);
+        if (idxP.empty() || idxF.empty()) return {};
+
+        // Legacy O(N²) path if requested
+        if (force_legacy_scan_()) {
+            vector<unique_ptr<ExplicitBitVect>> fps; fps.reserve(n);
+            for (int i=0;i<n;++i) {
+                ROMol* m=nullptr; try{ m=SmilesToMol(smiles[i]); }catch(...){ m=nullptr; }
+                fps.emplace_back(m? MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits_local):nullptr);
+                if (m) delete m;
             }
-            for (auto& th : threads) th.join();
-        } else {
-            // Sequential fallback
-            trips.reserve(n/2);
-            for (int i=0;i<n;++i){ if (!fps[i]) continue; 
-                vector<double> sims(n, -1.0);
-                for (int j=0;j<n;++j){ if (!fps[j]) continue; sims[j] = (i==j)? -1.0 : TanimotoSimilarity(*fps[i], *fps[j]); }
-                // argmax in each class
+            vector<tuple<int,int,int,double,double>> trips; trips.reserve(n/2);
+            for (int i=0;i<n;++i) {
+                if (!fps[i]) continue;
                 int iP=-1, iF=-1; double sP=-1.0, sF=-1.0;
-                for (int j=0;j<n;++j){ if (j==i || !fps[j]) continue; double s=sims[j];
-                    if (labels[j]==1){ if (s>sP){ sP=s; iP=j; } }
-                    else { if (s>sF){ sF=s; iF=j; } }
+                for (int j=0;j<n;++j) {
+                    if (i==j || !fps[j]) continue;
+                    double s = TanimotoSimilarity(*fps[i], *fps[j]);
+                    if (labels[j]==1) { if (s>sP) { sP=s; iP=j; } }
+                    else              { if (s>sF) { sF=s; iF=j; } }
                 }
-                if (iP>=0 && iF>=0 && sP>=sim_thresh_local && sF>=sim_thresh_local){ trips.emplace_back(i, iP, iF, sP, sF); }
+                if (iP>=0 && iF>=0 && sP>=sim_thresh_local && sF>=sim_thresh_local)
+                    trips.emplace_back(i,iP,iF,sP,sF);
             }
+            return trips;
         }
+
+        // Indexed fast path (Phase 2: with cache)
+        // Build global fp cache exactly once
+        if ((int)fp_global_.size() != (int)smiles.size())
+            build_fp_cache_global_(smiles, fp_radius);
         
-        for (auto *f: fps) if (f) delete f;
+        // Build postings from cache
+        auto ixP = build_postings_from_cache_(fp_global_, idxP, /*build_lists=*/true);
+        auto ixF = build_postings_from_cache_(fp_global_, idxF, /*build_lists=*/true);
+
+        vector<tuple<int,int,int,double,double>> trips;
+        trips.reserve(n/2);
+        mutex outMutex;
+        const int hw = (int)thread::hardware_concurrency();
+        const int T  = (hw>0? hw:4);
+        vector<thread> ths; ths.reserve(T);
+        atomic<int> next(0);
+
+        auto worker = [&](){
+            vector<int> accP(ixP.pop.size(),0), lastP(ixP.pop.size(),-1), touchedP; touchedP.reserve(512); // Phase 3: increased capacity
+            vector<int> accF(ixF.pop.size(),0), lastF(ixF.pop.size(),-1), touchedF; touchedF.reserve(512); // Phase 3: increased capacity
+            int epochP=1, epochF=1;
+            while (true) {
+                int i = next.fetch_add(1);
+                if (i>=n) break;
+                // Phase 2: Use cached fingerprint instead of recomputing
+                if (i >= (int)fp_global_.size() || fp_global_[i].pop == 0) continue;
+                const auto& a = fp_global_[i];
+                const vector<int>& a_on = a.on;
+                int a_pop = a.pop;
+
+                // PASS candidates (exclude self if PASS)
+                ++epochP; if (epochP==INT_MAX){ fill(lastP.begin(), lastP.end(), -1); epochP=1; }
+                argmax_neighbor_indexed_(a_on, a_pop, ixP, sim_thresh_local, accP, lastP, touchedP, epochP);
+                struct Cand{int pos; double T;};
+                vector<Cand> candP;
+                const double one_plus_t = 1.0 + sim_thresh_local;
+                for (int pos : touchedP) {
+                    int j_global = ixP.pos2idx[pos];
+                    if (j_global == i) continue; // skip self
+                    int c = accP[pos]; int b_pop = ixP.pop[pos];
+                    int cmin = (int)ceil( (sim_thresh_local * (a_pop + b_pop)) / one_plus_t );
+                    if (c < cmin) continue;
+                    double Ts = double(c) / double(a_pop + b_pop - c);
+                    if (Ts >= sim_thresh_local) candP.push_back({pos, Ts});
+                }
+                int iP = -1; double sP=-1.0;
+                if (!candP.empty()) {
+                    auto bestIt = max_element(candP.begin(), candP.end(),
+                                               [](const Cand& x, const Cand& y){ return x.T < y.T; });
+                    iP = ixP.pos2idx[bestIt->pos]; sP = bestIt->T;
+                }
+
+                // FAIL candidates
+                ++epochF; if (epochF==INT_MAX){ fill(lastF.begin(), lastF.end(), -1); epochF=1; }
+                argmax_neighbor_indexed_(a_on, a_pop, ixF, sim_thresh_local, accF, lastF, touchedF, epochF);
+                vector<Cand> candF;
+                for (int pos : touchedF) {
+                    int c = accF[pos]; int b_pop = ixF.pop[pos];
+                    int cmin = (int)ceil( (sim_thresh_local * (a_pop + b_pop)) / one_plus_t );
+                    if (c < cmin) continue;
+                    double Ts = double(c) / double(a_pop + b_pop - c);
+                    if (Ts >= sim_thresh_local) candF.push_back({pos, Ts});
+                }
+                int iF = -1; double sF=-1.0;
+                if (!candF.empty()) {
+                    auto bestIt = max_element(candF.begin(), candF.end(),
+                                               [](const Cand& x, const Cand& y){ return x.T < y.T; });
+                    iF = ixF.pos2idx[bestIt->pos]; sF = bestIt->T;
+                }
+
+                if (iP>=0 && iF>=0) {
+                    std::lock_guard<std::mutex> lk(outMutex);
+                    trips.emplace_back(i, iP, iF, sP, sF);
+                }
+            }
+        };
+        for (int t=0;t<T;++t) ths.emplace_back(worker);
+        for (auto& th: ths) th.join();
         return trips;
     }
     // NUCLEAR-FAST vector generation - single-pass processing, zero allocations
     // For non-"max" aggregation, falls back to generate_ftp_vector per view
-    // Helper: Convert map<string,double> to unordered_map for O(1) lookups
-    static inline unordered_map<string, double> to_umap(const map<string, double>& m) {
-        unordered_map<string, double> u;
-        u.reserve(m.size() * 1.3);  // Leave headroom to avoid rehash
-        for (const auto& kv : m) {
-            u.emplace(kv.first, kv.second);
-        }
-        return u;
-    }
-    
-    // Helper: Pack (bit, depth) into uint64_t for fast numeric keys
-    static inline uint64_t pack_key(uint32_t bit, uint8_t depth) {
-        return (uint64_t(bit) << 8) | uint64_t(depth);
-    }
-    
-    // Helper: Unpack uint64_t key to (bit, depth)
-    static inline void unpack_key(uint64_t k, uint32_t& bit, uint8_t& depth) {
-        depth = uint8_t(k & 0xFF);
-        bit = uint32_t(k >> 8);
-    }
-    
-    // Helper: Convert string key "(bit, depth)" to uint64_t (for backward compatibility)
-    static inline uint64_t parse_key(const string& key_str) {
-        uint32_t bit;
-        uint8_t depth;
-        if (sscanf(key_str.c_str(), "(%u, %hhu)", &bit, &depth) == 2) {
-            return pack_key(bit, depth);
-        }
-        return 0;  // Invalid key
-    }
-    
-    // Helper: Build numeric lookup maps from string maps
-    struct ViewLookupNumeric {
-        unordered_map<uint64_t, double> pass, fail;
-    };
-    
-    static ViewLookupNumeric build_numeric_lookup(const map<string, double>& pass_m,
-                                                   const map<string, double>& fail_m) {
-        ViewLookupNumeric v;
-        v.pass.reserve(pass_m.size() * 1.3);
-        v.fail.reserve(fail_m.size() * 1.3);
-        for (const auto& kv : pass_m) {
-            uint64_t key = parse_key(kv.first);
-            if (key != 0) v.pass.emplace(key, kv.second);
-        }
-        for (const auto& kv : fail_m) {
-            uint64_t key = parse_key(kv.first);
-            if (key != 0) v.fail.emplace(key, kv.second);
-        }
-        return v;
-    }
-
     tuple<vector<vector<double>>, vector<vector<double>>, vector<vector<double>>>
     build_3view_vectors_batch(const vector<string>& smiles,
                               int radius,
@@ -2407,55 +2554,21 @@ public:
                               const map<string, map<string, double>>& prevalence_data_3d,
                               double atom_gate = 0.0,
                               const string& atom_aggregation = "max",
-                              double softmax_temperature = 1.0,
-                              const vector<bool>* train_row_mask = nullptr,
-                              const unordered_map<string, double>* scale_1d = nullptr,
-                              const unordered_map<string, double>* scale_2d = nullptr,
-                              const unordered_map<string, double>* scale_3d = nullptr,
-                              int num_threads = 0) {
+                              double softmax_temperature = 1.0) {
+        
         const int n_molecules = smiles.size();
         
         // For non-max aggregation, use generate_ftp_vector per view
         if (atom_aggregation != "max") {
-            vector<vector<double>> V1(n_molecules), V2(n_molecules), V3(n_molecules);
+            vector<vector<double>> V1, V2, V3;
+            V1.reserve(n_molecules);
+            V2.reserve(n_molecules);
+            V3.reserve(n_molecules);
             
-            // Use std::thread for consistency with rest of codebase (like build_3view_vectors_mode_threaded)
-            const int hw = (int)std::thread::hardware_concurrency();
-            int T = 1;
-            if (num_threads > 0) {
-                T = num_threads;
-            } else if (num_threads == -1) {
-                T = (hw > 0) ? hw : 1;
-            } else if (num_threads == 0) {
-                T = (hw > 0) ? hw : 1;
-            }
-            
-            if (T > 1 && n_molecules > 1) {
-                vector<thread> threads;
-                threads.reserve(T);
-                auto worker = [&](int start, int end) {
-                    for (int i = start; i < end; ++i) {
-                        V1[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature);
-                        V2[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature);
-                        V3[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
-                    }
-                };
-                int chunk = (n_molecules + T - 1) / T;
-                int s = 0;
-                for (int t = 0; t < T; ++t) {
-                    int e = min(n_molecules, s + chunk);
-                    if (s >= e) break;
-                    threads.emplace_back(worker, s, e);
-                    s = e;
-                }
-                for (auto& th : threads) th.join();
-            } else {
-                // Sequential fallback
-                for (int i = 0; i < n_molecules; ++i) {
-                    V1[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature);
-                    V2[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature);
-                    V3[i] = generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
-                }
+            for (int i = 0; i < n_molecules; ++i) {
+                V1.push_back(generate_ftp_vector(smiles[i], radius, prevalence_data_1d, atom_gate, atom_aggregation, softmax_temperature));
+                V2.push_back(generate_ftp_vector(smiles[i], radius, prevalence_data_2d, atom_gate, atom_aggregation, softmax_temperature));
+                V3.push_back(generate_ftp_vector(smiles[i], radius, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature));
             }
             
             return make_tuple(std::move(V1), std::move(V2), std::move(V3));
@@ -2469,9 +2582,13 @@ public:
         vector<vector<double>> V2(n_molecules, vector<double>(cols, 0.0));
         vector<vector<double>> V3(n_molecules, vector<double>(cols, 0.0));
         
-        // PERF: Convert to unordered_map for O(1) lookups and numeric keys for speed
-        ViewLookupNumeric lookup_1d, lookup_2d, lookup_3d;
-        unordered_map<uint64_t, double> scale_numeric_1d, scale_numeric_2d, scale_numeric_3d;
+        // Pre-compute lookup references for NUCLEAR-fast access
+        const map<string, double>* pass_map_1d = nullptr;
+        const map<string, double>* fail_map_1d = nullptr;
+        const map<string, double>* pass_map_2d = nullptr;
+        const map<string, double>* fail_map_2d = nullptr;
+        const map<string, double>* pass_map_3d = nullptr;
+        const map<string, double>* fail_map_3d = nullptr;
         
         auto itP_1d = prevalence_data_1d.find("PASS");
         auto itF_1d = prevalence_data_1d.find("FAIL");
@@ -2480,70 +2597,19 @@ public:
         auto itP_3d = prevalence_data_3d.find("PASS");
         auto itF_3d = prevalence_data_3d.find("FAIL");
         
-        if (itP_1d != prevalence_data_1d.end() || itF_1d != prevalence_data_1d.end()) {
-            lookup_1d = build_numeric_lookup(
-                (itP_1d != prevalence_data_1d.end()) ? itP_1d->second : map<string, double>{},
-                (itF_1d != prevalence_data_1d.end()) ? itF_1d->second : map<string, double>{}
-            );
-        }
-        if (itP_2d != prevalence_data_2d.end() || itF_2d != prevalence_data_2d.end()) {
-            lookup_2d = build_numeric_lookup(
-                (itP_2d != prevalence_data_2d.end()) ? itP_2d->second : map<string, double>{},
-                (itF_2d != prevalence_data_2d.end()) ? itF_2d->second : map<string, double>{}
-            );
-        }
-        if (itP_3d != prevalence_data_3d.end() || itF_3d != prevalence_data_3d.end()) {
-            lookup_3d = build_numeric_lookup(
-                (itP_3d != prevalence_data_3d.end()) ? itP_3d->second : map<string, double>{},
-                (itF_3d != prevalence_data_3d.end()) ? itF_3d->second : map<string, double>{}
-            );
-        }
+        if (itP_1d != prevalence_data_1d.end()) pass_map_1d = &itP_1d->second;
+        if (itF_1d != prevalence_data_1d.end()) fail_map_1d = &itF_1d->second;
+        if (itP_2d != prevalence_data_2d.end()) pass_map_2d = &itP_2d->second;
+        if (itF_2d != prevalence_data_2d.end()) fail_map_2d = &itF_2d->second;
+        if (itP_3d != prevalence_data_3d.end()) pass_map_3d = &itP_3d->second;
+        if (itF_3d != prevalence_data_3d.end()) fail_map_3d = &itF_3d->second;
         
-        // Convert scale maps to numeric keys
-        if (scale_1d) {
-            scale_numeric_1d.reserve(scale_1d->size() * 1.3);
-            for (const auto& kv : *scale_1d) {
-                uint64_t key = parse_key(kv.first);
-                if (key != 0) scale_numeric_1d.emplace(key, kv.second);
-            }
-        }
-        if (scale_2d) {
-            scale_numeric_2d.reserve(scale_2d->size() * 1.3);
-            for (const auto& kv : *scale_2d) {
-                uint64_t key = parse_key(kv.first);
-                if (key != 0) scale_numeric_2d.emplace(key, kv.second);
-            }
-        }
-        if (scale_3d) {
-            scale_numeric_3d.reserve(scale_3d->size() * 1.3);
-            for (const auto& kv : *scale_3d) {
-                uint64_t key = parse_key(kv.first);
-                if (key != 0) scale_numeric_3d.emplace(key, kv.second);
-            }
-        }
+        // NUCLEAR-fast key building with pre-allocated buffer
+        string key_buffer;
+        key_buffer.reserve(32);
         
         // NUCLEAR-FAST: Process all molecules with inline vector computation
-        // Use std::thread for consistency with rest of codebase (like build_3view_vectors_mode_threaded)
-        const int hw = (int)std::thread::hardware_concurrency();
-        int T = 1;
-        if (num_threads > 0) {
-            T = num_threads;
-        } else if (num_threads == -1) {
-            T = (hw > 0) ? hw : 1;
-        } else if (num_threads == 0) {
-            T = (hw > 0) ? hw : 1;
-        }
-        
-        if (T > 1 && n_molecules > 1) {
-            // PERF: Release GIL only during parallel computation
-            py::gil_scoped_release nogil;
-            
-            // Parallel processing with std::thread
-            vector<thread> threads;
-            threads.reserve(T);
-            auto worker = [&](int start, int end) {
-                // PERF: Capture numeric lookups and scale maps by reference (no string buffer needed)
-                for (int i = start; i < end; ++i) {
+        for (int i = 0; i < n_molecules; ++i) {
             try {
                 ROMol* mol = SmilesToMol(smiles[i]);
                 if (!mol) continue;
@@ -2571,89 +2637,76 @@ public:
                     *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
                     false, true, true, false, &bitInfo, false);
 
-                // PERF: Process bit info with numeric keys (no string building)
+                // NUCLEAR-fast: Process bit info with inline vector computation
                 for (const auto& kv : bitInfo) {
-                    uint32_t bit = kv.first;
+                    unsigned int bit = kv.first;
                     const auto& hits = kv.second;
                     
                     for (const auto& ad : hits) {
                         unsigned int atomIdx = ad.first;
-                        uint8_t depth = static_cast<uint8_t>(ad.second);
+                        unsigned int depth = ad.second;
                         
                         if (atomIdx >= static_cast<unsigned int>(n_atoms) || 
-                            depth > static_cast<uint8_t>(radius)) continue;
+                            depth > static_cast<unsigned int>(radius)) continue;
                         
-                        // PERF: Use numeric key instead of string building
-                        uint64_t key = pack_key(bit, depth);
+                        // NUCLEAR-fast key building
+                        key_buffer.clear();
+                        key_buffer = "(";
+                        key_buffer += to_string(bit);
+                        key_buffer += ", ";
+                        key_buffer += to_string(depth);
+                        key_buffer += ")";
                         
-                        // PERF: Apply exact per-key rescaling for training molecules
-                        const bool is_train = train_row_mask && i < (int)train_row_mask->size() && (*train_row_mask)[i];
-                        double s1 = 1.0, s2 = 1.0, s3 = 1.0;
-                        if (is_train) {
-                            if (!scale_numeric_1d.empty()) {
-                                auto it = scale_numeric_1d.find(key);
-                                if (it != scale_numeric_1d.end()) s1 = it->second;
-                            }
-                            if (!scale_numeric_2d.empty()) {
-                                auto it = scale_numeric_2d.find(key);
-                                if (it != scale_numeric_2d.end()) s2 = it->second;
-                            }
-                            if (!scale_numeric_3d.empty()) {
-                                auto it = scale_numeric_3d.find(key);
-                                if (it != scale_numeric_3d.end()) s3 = it->second;
-                            }
-                        }
-                        
-                        // PERF: Process all prevalence types with numeric key lookups (O(1) unordered_map)
+                        // NUCLEAR-fast: Process all prevalence types inline
                         // 1D prevalence
-                        if (!lookup_1d.pass.empty()) {
-                            auto itP = lookup_1d.pass.find(key);
-                            if (itP != lookup_1d.pass.end()) {
-                                double w = itP->second * s1;
+                        if (pass_map_1d) {
+                            auto itP = pass_map_1d->find(key_buffer);
+                            if (itP != pass_map_1d->end()) {
+                                double w = itP->second;
                                 prevalence_1d[atomIdx] = std::max(prevalence_1d[atomIdx], w);
                                 prevalencer_1d[atomIdx][depth] = std::max(prevalencer_1d[atomIdx][depth], w);
                             }
                         }
-                        if (!lookup_1d.fail.empty()) {
-                            auto itF = lookup_1d.fail.find(key);
-                            if (itF != lookup_1d.fail.end()) {
-                                double wneg = -(itF->second * s1);
+                        if (fail_map_1d) {
+                            auto itF = fail_map_1d->find(key_buffer);
+                            if (itF != fail_map_1d->end()) {
+                                double wneg = -itF->second;
                                 prevalence_1d[atomIdx] = std::min(prevalence_1d[atomIdx], wneg);
                                 prevalencer_1d[atomIdx][depth] = std::min(prevalencer_1d[atomIdx][depth], wneg);
                             }
                         }
                         
                         // 2D prevalence
-                        if (!lookup_2d.pass.empty()) {
-                            auto itP = lookup_2d.pass.find(key);
-                            if (itP != lookup_2d.pass.end()) {
-                                double w = itP->second * s2;
+                        if (pass_map_2d) {
+                            auto itP = pass_map_2d->find(key_buffer);
+                            if (itP != pass_map_2d->end()) {
+                                double w = itP->second;
                                 prevalence_2d[atomIdx] = std::max(prevalence_2d[atomIdx], w);
                                 prevalencer_2d[atomIdx][depth] = std::max(prevalencer_2d[atomIdx][depth], w);
                             }
                         }
-                        if (!lookup_2d.fail.empty()) {
-                            auto itF = lookup_2d.fail.find(key);
-                            if (itF != lookup_2d.fail.end()) {
-                                double wneg = -(itF->second * s2);
+                        if (fail_map_2d) {
+                            auto itF = fail_map_2d->find(key_buffer);
+                            if (itF != fail_map_2d->end()) {
+                                double wneg = -itF->second;
                                 prevalence_2d[atomIdx] = std::min(prevalence_2d[atomIdx], wneg);
                                 prevalencer_2d[atomIdx][depth] = std::min(prevalencer_2d[atomIdx][depth], wneg);
                             }
                         }
                         
                         // 3D prevalence
-                        if (!lookup_3d.pass.empty()) {
-                            auto itP = lookup_3d.pass.find(key);
-                            if (itP != lookup_3d.pass.end()) {
-                                double w = itP->second * s3;
+                        if (pass_map_3d) {
+                            auto itP = pass_map_3d->find(key_buffer);
+                            if (itP != pass_map_3d->end()) {
+                                double w = itP->second;
                                 prevalence_3d[atomIdx] = std::max(prevalence_3d[atomIdx], w);
                                 prevalencer_3d[atomIdx][depth] = std::max(prevalencer_3d[atomIdx][depth], w);
                             }
                         }
-                        if (!lookup_3d.fail.empty()) {
-                            auto itF = lookup_3d.fail.find(key);
-                            if (itF != lookup_3d.fail.end()) {
-                                double wneg = -(itF->second * s3);
+                        if (fail_map_3d) {
+                            auto itF = fail_map_3d->find(key_buffer);
+                            if (itF != fail_map_3d->end()) {
+                                double wneg = -itF->second;
                                 prevalence_3d[atomIdx] = std::min(prevalence_3d[atomIdx], wneg);
                                 prevalencer_3d[atomIdx][depth] = std::min(prevalencer_3d[atomIdx][depth], wneg);
                             }
@@ -2711,188 +2764,6 @@ public:
             } catch (...) {
                 // Continue with next molecule on error
             }
-                }
-            };
-            int chunk = (n_molecules + T - 1) / T;
-            int s = 0;
-            for (int t = 0; t < T; ++t) {
-                int e = min(n_molecules, s + chunk);
-                if (s >= e) break;
-                threads.emplace_back(worker, s, e);
-                s = e;
-            }
-            for (auto& th : threads) th.join();
-            // GIL automatically reacquired when nogil goes out of scope
-        } else {
-            // PERF: Release GIL only during sequential computation
-            py::gil_scoped_release nogil;
-            
-            // PERF: Sequential fallback with numeric keys (no string buffer needed)
-            for (int i = 0; i < n_molecules; ++i) {
-                try {
-                    ROMol* mol = SmilesToMol(smiles[i]);
-                    if (!mol) continue;
-
-                    const int n_atoms = mol->getNumAtoms();
-                    if (n_atoms == 0) {
-                        delete mol;
-                        continue;
-                    }
-
-                    // NUCLEAR-fast: Inline prevalence arrays with exact size
-                    vector<double> prevalence_1d(n_atoms, 0.0);
-                    vector<double> prevalence_2d(n_atoms, 0.0);
-                    vector<double> prevalence_3d(n_atoms, 0.0);
-                    vector<vector<double>> prevalencer_1d(n_atoms, vector<double>(radius + 1, 0.0));
-                    vector<vector<double>> prevalencer_2d(n_atoms, vector<double>(radius + 1, 0.0));
-                    vector<vector<double>> prevalencer_3d(n_atoms, vector<double>(radius + 1, 0.0));
-
-                    // Get fingerprint info
-                    std::vector<boost::uint32_t>* invariants = nullptr;
-                    const std::vector<boost::uint32_t>* fromAtoms = nullptr;
-                    MorganFingerprints::BitInfoMap bitInfo;
-                    
-                    auto *siv = MorganFingerprints::getFingerprint(
-                        *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
-                        false, true, true, false, &bitInfo, false);
-
-                    // PERF: Process bit info with numeric keys (no string building)
-                    for (const auto& kv : bitInfo) {
-                        uint32_t bit = kv.first;
-                        const auto& hits = kv.second;
-                        
-                        for (const auto& ad : hits) {
-                            unsigned int atomIdx = ad.first;
-                            uint8_t depth = static_cast<uint8_t>(ad.second);
-                            
-                            if (atomIdx >= static_cast<unsigned int>(n_atoms) || 
-                                depth > static_cast<uint8_t>(radius)) continue;
-                            
-                            // PERF: Use numeric key instead of string building
-                            uint64_t key = pack_key(bit, depth);
-                            
-                            // PERF: Apply exact per-key rescaling for training molecules
-                            const bool is_train = train_row_mask && i < (int)train_row_mask->size() && (*train_row_mask)[i];
-                            double s1 = 1.0, s2 = 1.0, s3 = 1.0;
-                            if (is_train) {
-                                if (!scale_numeric_1d.empty()) {
-                                    auto it = scale_numeric_1d.find(key);
-                                    if (it != scale_numeric_1d.end()) s1 = it->second;
-                                }
-                                if (!scale_numeric_2d.empty()) {
-                                    auto it = scale_numeric_2d.find(key);
-                                    if (it != scale_numeric_2d.end()) s2 = it->second;
-                                }
-                                if (!scale_numeric_3d.empty()) {
-                                    auto it = scale_numeric_3d.find(key);
-                                    if (it != scale_numeric_3d.end()) s3 = it->second;
-                                }
-                            }
-                            
-                            // PERF: Process all prevalence types with numeric key lookups (O(1) unordered_map)
-                            // 1D prevalence
-                            if (!lookup_1d.pass.empty()) {
-                                auto itP = lookup_1d.pass.find(key);
-                                if (itP != lookup_1d.pass.end()) {
-                                    double w = itP->second * s1;
-                                    prevalence_1d[atomIdx] = std::max(prevalence_1d[atomIdx], w);
-                                    prevalencer_1d[atomIdx][depth] = std::max(prevalencer_1d[atomIdx][depth], w);
-                                }
-                            }
-                            if (!lookup_1d.fail.empty()) {
-                                auto itF = lookup_1d.fail.find(key);
-                                if (itF != lookup_1d.fail.end()) {
-                                    double wneg = -(itF->second * s1);
-                                    prevalence_1d[atomIdx] = std::min(prevalence_1d[atomIdx], wneg);
-                                    prevalencer_1d[atomIdx][depth] = std::min(prevalencer_1d[atomIdx][depth], wneg);
-                                }
-                            }
-                            
-                            // 2D prevalence
-                            if (!lookup_2d.pass.empty()) {
-                                auto itP = lookup_2d.pass.find(key);
-                                if (itP != lookup_2d.pass.end()) {
-                                    double w = itP->second * s2;
-                                    prevalence_2d[atomIdx] = std::max(prevalence_2d[atomIdx], w);
-                                    prevalencer_2d[atomIdx][depth] = std::max(prevalencer_2d[atomIdx][depth], w);
-                                }
-                            }
-                            if (!lookup_2d.fail.empty()) {
-                                auto itF = lookup_2d.fail.find(key);
-                                if (itF != lookup_2d.fail.end()) {
-                                    double wneg = -(itF->second * s2);
-                                    prevalence_2d[atomIdx] = std::min(prevalence_2d[atomIdx], wneg);
-                                    prevalencer_2d[atomIdx][depth] = std::min(prevalencer_2d[atomIdx][depth], wneg);
-                                }
-                            }
-                            
-                            // 3D prevalence
-                            if (!lookup_3d.pass.empty()) {
-                                auto itP = lookup_3d.pass.find(key);
-                                if (itP != lookup_3d.pass.end()) {
-                                    double w = itP->second * s3;
-                                    prevalence_3d[atomIdx] = std::max(prevalence_3d[atomIdx], w);
-                                    prevalencer_3d[atomIdx][depth] = std::max(prevalencer_3d[atomIdx][depth], w);
-                                }
-                            }
-                            if (!lookup_3d.fail.empty()) {
-                                auto itF = lookup_3d.fail.find(key);
-                                if (itF != lookup_3d.fail.end()) {
-                                    double wneg = -(itF->second * s3);
-                                    prevalence_3d[atomIdx] = std::min(prevalence_3d[atomIdx], wneg);
-                                    prevalencer_3d[atomIdx][depth] = std::min(prevalencer_3d[atomIdx][depth], wneg);
-                                }
-                            }
-                        }
-                    }
-
-                    // Compute margins
-                    double denom = static_cast<double>(n_atoms);
-                    int p1 = 0, n1 = 0, p2 = 0, n2 = 0, p3 = 0, n3 = 0;
-                    for (int j = 0; j < n_atoms; ++j) {
-                        double v1 = prevalence_1d[j];
-                        double v2 = prevalence_2d[j];
-                        double v3 = prevalence_3d[j];
-                        p1 += (v1 >= atom_gate) ? 1 : 0;
-                        n1 += (v1 <= -atom_gate) ? 1 : 0;
-                        p2 += (v2 >= atom_gate) ? 1 : 0;
-                        n2 += (v2 <= -atom_gate) ? 1 : 0;
-                        p3 += (v3 >= atom_gate) ? 1 : 0;
-                        n3 += (v3 <= -atom_gate) ? 1 : 0;
-                    }
-                    
-                    V1[i][0] = static_cast<double>(p1 - n1);
-                    V1[i][1] = V1[i][0] / denom;
-                    V2[i][0] = static_cast<double>(p2 - n2);
-                    V2[i][1] = V2[i][0] / denom;
-                    V3[i][0] = static_cast<double>(p3 - n3);
-                    V3[i][1] = V3[i][0] / denom;
-                    
-                    // Per-depth computation
-                    for (int d = 0; d <= radius; ++d) {
-                        int pos1 = 0, neg1 = 0, pos2 = 0, neg2 = 0, pos3 = 0, neg3 = 0;
-                        for (int a = 0; a < n_atoms; ++a) {
-                            double v1 = prevalencer_1d[a][d];
-                            double v2 = prevalencer_2d[a][d];
-                            double v3 = prevalencer_3d[a][d];
-                            pos1 += (v1 >= atom_gate) ? 1 : 0;
-                            neg1 += (v1 <= -atom_gate) ? 1 : 0;
-                            pos2 += (v2 >= atom_gate) ? 1 : 0;
-                            neg2 += (v2 <= -atom_gate) ? 1 : 0;
-                            pos3 += (v3 >= atom_gate) ? 1 : 0;
-                            neg3 += (v3 <= -atom_gate) ? 1 : 0;
-                        }
-                        V1[i][2 + d] = static_cast<double>(pos1 - neg1) / denom;
-                        V2[i][2 + d] = static_cast<double>(pos2 - neg2) / denom;
-                        V3[i][2 + d] = static_cast<double>(pos3 - neg3) / denom;
-                    }
-                    
-                    if (siv) delete siv;
-                    delete mol;
-                } catch (...) {
-                    // Skip invalid molecules
-                }
-            }
         }
         
         return make_tuple(std::move(V1), std::move(V2), std::move(V3));
@@ -2907,16 +2778,9 @@ public:
                         const map<string, map<string, double>>& prevalence_data_3d,
                         double atom_gate = 0.0,
                         const string& atom_aggregation = "max",
-                        double softmax_temperature = 1.0,
-                        const vector<bool>* train_row_mask = nullptr,
-                        const unordered_map<string, double>* scale_1d = nullptr,
-                        const unordered_map<string, double>* scale_2d = nullptr,
-                        const unordered_map<string, double>* scale_3d = nullptr,
-                        int num_threads = 0) {  // FIXED: Add num_threads parameter for OpenMP
-        // Use the MEGA-FAST batch version with optional rescaling
-        return build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d, 
-                                        atom_gate, atom_aggregation, softmax_temperature,
-                                        train_row_mask, scale_1d, scale_2d, scale_3d, num_threads);  // FIXED: Pass num_threads
+                        double softmax_temperature = 1.0) {
+        // Use the MEGA-FAST batch version
+        return build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
     }
 
     // LOO-like mode variant (mode: "total" or "influence"). labels are binary 0/1 to compute class totals
@@ -3538,7 +3402,7 @@ public:
             result = build_3view_vectors(
                 smiles, radius,
                 prevalence_data_1d_filtered, prevalence_data_2d_filtered, prevalence_data_3d_filtered,
-                0.0, atom_aggregation, 1.0, nullptr, nullptr, nullptr, nullptr, num_threads  // FIXED: Pass num_threads for OpenMP
+                0.0, atom_aggregation
             );
         } else {
             // Other modes (influence, meanloo, etc.): use mode-aware function
@@ -3637,14 +3501,10 @@ public:
         int k_threshold = 1,
         bool rescale_n_minus_k = false,
         const string& atom_aggregation = "max",
-        double softmax_temperature = 1.0,
-        double loo_smoothing_tau = 1.0,  // NEW: Smoothing parameter for LOO rescaling
-        const vector<bool>* train_row_mask = nullptr,  // NEW: Per-molecule training mask for rescaling
-        int num_threads = 0  // NEW: Number of threads for parallelization (0=auto)
+        double softmax_temperature = 1.0
     ) {
         // Create filtered prevalence dictionaries using PRE-COMPUTED counts
         // This ensures vectors are independent of batch size!
-        // NOTE: We filter keys but DON'T rescale here - rescaling is applied per-molecule later
         map<string, map<string, double>> prevalence_data_1d_filtered, prevalence_data_2d_filtered, prevalence_data_3d_filtered;
         
         // Filter 1D prevalence
@@ -3664,8 +3524,13 @@ public:
                 bool keep_key = (mol_count >= k_threshold) && (tot_count >= k_threshold);
                 
                 if (keep_key) {
-                    // FIXED: Don't rescale here - rescaling is applied per-molecule later based on train_row_mask
-                    // Store the original value and the rescale factor separately
+                    if (rescale_n_minus_k) {
+                        // FIXED: Use per-key rescaling (k_j-1)/k_j instead of global (N-k+1)/N
+                        // k_j = mol_count (number of molecules containing this key)
+                        // This is the correct Key-LOO rescaling factor
+                        double rescale_factor = (mol_count > 1) ? (double)(mol_count - 1) / (double)mol_count : 1.0;
+                        value *= rescale_factor;
+                    }
                     prevalence_data_1d_filtered[class_name][key] = value;
                 }
             }
@@ -3687,7 +3552,11 @@ public:
                 bool keep_key = (mol_count >= k_threshold) && (tot_count >= k_threshold);
                 
                 if (keep_key) {
-                    // FIXED: Don't rescale here - rescaling is applied per-molecule later
+                    if (rescale_n_minus_k) {
+                        // FIXED: Use per-key rescaling (k_j-1)/k_j instead of global (N-k+1)/N
+                        double rescale_factor = (mol_count > 1) ? (double)(mol_count - 1) / (double)mol_count : 1.0;
+                        value *= rescale_factor;
+                    }
                     prevalence_data_2d_filtered[class_name][key] = value;
                 }
             }
@@ -3709,61 +3578,24 @@ public:
                 bool keep_key = (mol_count >= k_threshold) && (tot_count >= k_threshold);
                 
                 if (keep_key) {
-                    // FIXED: Don't rescale here - rescaling is applied per-molecule later
+                    if (rescale_n_minus_k) {
+                        // FIXED: Use per-key rescaling (k_j-1)/k_j instead of global (N-k+1)/N
+                        double rescale_factor = (mol_count > 1) ? (double)(mol_count - 1) / (double)mol_count : 1.0;
+                        value *= rescale_factor;
+                    }
                     prevalence_data_3d_filtered[class_name][key] = value;
                 }
             }
         }
         
-        // FIXED: Precompute per-key scale factors for exact LOO rescaling
-        // This is more accurate than the previous average-factor approximation
-        unordered_map<string, double> scale_1d, scale_2d, scale_3d;
-        const vector<bool>* train_mask_ptr = nullptr;
-        
-        if (rescale_n_minus_k && train_row_mask != nullptr && train_row_mask->size() > 0) {
-            train_mask_ptr = train_row_mask;
-            
-            // Build scale factor maps for each view
-            auto scale_of = [&](int k) { return (k + loo_smoothing_tau - 1.0) / (k + loo_smoothing_tau); };
-            
-            // 1D scale factors
-            for (const auto& [key, mol_count] : key_molecule_count_1d) {
-                if (mol_count >= k_threshold) {
-                    scale_1d[key] = scale_of(mol_count);
-                }
-            }
-            
-            // 2D scale factors (use 1D counts since 2D prevalence uses single keys)
-            for (const auto& [key, mol_count] : key_molecule_count_2d) {
-                if (mol_count >= k_threshold) {
-                    scale_2d[key] = scale_of(mol_count);
-                }
-            }
-            
-            // 3D scale factors (use 1D counts)
-            for (const auto& [key, mol_count] : key_molecule_count_3d) {
-                if (mol_count >= k_threshold) {
-                    scale_3d[key] = scale_of(mol_count);
-                }
-            }
-        }
-        
-        // Build vectors with exact per-key rescaling applied during lookup
-        // This preserves max semantics exactly and avoids the extra motif-extraction pass
-        auto [V1, V2, V3] = build_3view_vectors_batch(
+        // Build vectors using filtered prevalence - simple and stateless!
+        return build_3view_vectors(
             smiles, radius,
             prevalence_data_1d_filtered, prevalence_data_2d_filtered, prevalence_data_3d_filtered,
             0.0,  // atom_gate
             atom_aggregation,
-            softmax_temperature,
-            train_mask_ptr,  // Pass train_row_mask for per-molecule check
-            scale_1d.empty() ? nullptr : &scale_1d,  // Pass scale maps if rescaling enabled
-            scale_2d.empty() ? nullptr : &scale_2d,
-            scale_3d.empty() ? nullptr : &scale_3d,
-            num_threads  // NEW: Pass num_threads for OpenMP parallelization
+            softmax_temperature
         );
-        
-        return make_tuple(V1, V2, V3);
     }
 
     // Molecule-level PASS–FAIL pairs exactly matching Python make_pairs()
@@ -3772,128 +3604,115 @@ public:
                                                           int fp_radius = 2,
                                                           int nBits_local = 2048,
                                                           double sim_thresh_local = 0.85,
-                                                          unsigned int seed = 0,
-                                                          int num_threads = 0) {  // PERF: Add num_threads parameter
+                                                          unsigned int seed = 0) {
         const int n = (int)smiles.size();
         // indices by class
         vector<int> idxP, idxF; idxP.reserve(n); idxF.reserve(n);
         for (int i=0;i<n;++i) ((labels[i]==1)? idxP:idxF).push_back(i);
+        if (idxP.empty() || idxF.empty()) return {};
 
-        // FAIL fingerprints (once) - PERF: Precompute all FAIL FPs
-        vector<ExplicitBitVect*> fpsF; fpsF.reserve(idxF.size());
-        for (int j : idxF) {
-            ROMol* m=nullptr; try { m=SmilesToMol(smiles[j]); } catch (...) { m=nullptr; }
-            fpsF.push_back(m ? MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits_local) : nullptr);
-            if (m) delete m;
-        }
-        
-        // PERF: Thread-safe availability tracking
-        vector<atomic<char>> availF(idxF.size());
-        for (auto& a : availF) a.store(1);
-
-        // PASS order shuffled
-        mt19937 rng(seed);
-        vector<int> order = idxP; shuffle(order.begin(), order.end(), rng);
-
-        // PERF: Thread-safe pairs collection
-        vector<tuple<int,int,double>> pairs;
-        mutex pairs_mutex;
-        
-        // PERF: Determine thread count
-        const int hw = (int)std::thread::hardware_concurrency();
-        int T = 1;
-        if (num_threads > 0) {
-            T = num_threads;
-        } else if (num_threads == -1) {
-            T = (hw > 0) ? hw : 1;
-        } else if (num_threads == 0) {
-            T = (hw > 0) ? hw : 1;
-        }
-        
-        // PERF: Parallelize PASS loop
-        if (T > 1 && order.size() > 1) {
-            py::gil_scoped_release nogil;
-            
-            vector<thread> threads;
-            threads.reserve(T);
-            
-            auto worker = [&](int start, int end) {
-                vector<tuple<int,int,double>> local_pairs;
-                local_pairs.reserve((end - start) / 2);  // Estimate
-                
-                for (int idx = start; idx < end; ++idx) {
-                    int iP = order[idx];
-                    
-                    // FP for PASS iP
-                    ROMol* mP=nullptr; try { mP=SmilesToMol(smiles[iP]); } catch (...) { mP=nullptr; }
-                    if (!mP) continue;
-                    unique_ptr<ExplicitBitVect> fpP(MorganFingerprints::getFingerprintAsBitVect(*mP, fp_radius, nBits_local));
-                    delete mP;
-                    if (!fpP) continue;
-
-                    // argmax over available FAILs (with atomic check)
-                    int bestJ = -1; double bestSim = -1.0;
-                    for (size_t t=0; t<idxF.size(); ++t) {
-                        if (availF[t].load() == 0) continue;  // Already taken
-                        if (!fpsF[t]) continue;
-                        double s = TanimotoSimilarity(*fpP, *fpsF[t]);
-                        if (s > bestSim) { bestSim = s; bestJ = (int)t; }
-                    }
-                    
-                    // Try to claim bestJ atomically
-                    if (bestJ >= 0 && bestSim >= sim_thresh_local) {
-                        char expected = 1;
-                        if (availF[bestJ].compare_exchange_strong(expected, 0)) {
-                            // Successfully claimed
-                            local_pairs.emplace_back(iP, idxF[bestJ], bestSim);
-                        }
-                    }
-                }
-                
-                // Merge local pairs (thread-safe)
-                if (!local_pairs.empty()) {
-                    lock_guard<mutex> lock(pairs_mutex);
-                    pairs.insert(pairs.end(), local_pairs.begin(), local_pairs.end());
-                }
-            };
-            
-            int chunk = (order.size() + T - 1) / T;
-            int s = 0;
-            for (int t = 0; t < T; ++t) {
-                int e = min((int)order.size(), s + chunk);
-                if (s >= e) break;
-                threads.emplace_back(worker, s, e);
-                s = e;
+        // -------- legacy O(N²) path (for debugging/regression) --------
+        if (force_legacy_scan_()) {
+            // Precompute FAIL fps
+            vector<unique_ptr<ExplicitBitVect>> fpsF; fpsF.reserve(idxF.size());
+            for (int j : idxF) {
+                ROMol* m=nullptr; try { m=SmilesToMol(smiles[j]); } catch (...) { m=nullptr; }
+                fpsF.emplace_back(m ? MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits_local) : nullptr);
+                if (m) delete m;
             }
-            for (auto& th : threads) th.join();
-        } else {
-            // Sequential fallback
-            pairs.reserve(idxP.size());
+            vector<char> availF(idxF.size(), 1);
+            mt19937 rng(seed);
+            vector<int> order = idxP; shuffle(order.begin(), order.end(), rng);
+            vector<tuple<int,int,double>> pairs; pairs.reserve(idxP.size());
             for (int iP : order) {
-                // FP for PASS iP
                 ROMol* mP=nullptr; try { mP=SmilesToMol(smiles[iP]); } catch (...) { mP=nullptr; }
                 if (!mP) continue;
                 unique_ptr<ExplicitBitVect> fpP(MorganFingerprints::getFingerprintAsBitVect(*mP, fp_radius, nBits_local));
-                delete mP;
-                if (!fpP) continue;
-
-                // argmax over available FAILs
+                delete mP; if (!fpP) continue;
                 int bestJ = -1; double bestSim = -1.0;
                 for (size_t t=0; t<idxF.size(); ++t) {
-                    if (availF[t].load() == 0) continue;
-                    if (!fpsF[t]) continue;
+                    if (!availF[t] || !fpsF[t]) continue;
                     double s = TanimotoSimilarity(*fpP, *fpsF[t]);
                     if (s > bestSim) { bestSim = s; bestJ = (int)t; }
                 }
                 if (bestJ >= 0 && bestSim >= sim_thresh_local) {
                     pairs.emplace_back(iP, idxF[bestJ], bestSim);
-                    availF[bestJ].store(0);
+                    availF[bestJ] = 0;
                 }
             }
+            return pairs;
         }
 
-        // cleanup FAIL fps
-        for (auto *f : fpsF) if (f) delete f;
+        // -------------------- indexed fast path (Phase 2: with cache) ------------------------
+        // Build global fp cache exactly once
+        if ((int)fp_global_.size() != (int)smiles.size())
+            build_fp_cache_global_(smiles, fp_radius);
+        
+        // Build postings from cache
+        auto ixF = build_postings_from_cache_(fp_global_, idxF, /*build_lists=*/true);
+        auto ixP = build_postings_from_cache_(fp_global_, idxP, /*build_lists=*/false);
+        const int MF = (int)idxF.size();
+        vector<atomic<uint8_t>> fAvail(MF);
+        for (int p=0;p<MF;++p) fAvail[p].store(1, std::memory_order_relaxed);
+
+        mt19937 rng(seed);
+        vector<int> order = idxP; shuffle(order.begin(), order.end(), rng);
+
+        vector<tuple<int,int,double>> pairs; pairs.reserve(idxP.size());
+        mutex outMutex;
+
+        const int hw = (int)thread::hardware_concurrency();
+        const int T  = (hw>0? hw: 4);
+        vector<thread> ths; ths.reserve(T);
+        atomic<int> next(0);
+
+        auto worker = [&]() {
+            vector<int> acc(MF, 0), last(MF, -1), touched; touched.reserve(512); // Phase 3: increased capacity
+            int epoch = 1;
+            for (;;) {
+                int k = next.fetch_add(1);
+                if (k >= (int)order.size()) break;
+                int iP = order[k];
+                // Phase 2: Use cached fingerprint instead of recomputing
+                if (iP >= (int)fp_global_.size() || fp_global_[iP].pop == 0) continue;
+                const auto& a = fp_global_[iP];
+                const vector<int>& a_on = a.on;
+                int a_pop = a.pop;
+                ++epoch; if (epoch==INT_MAX){ fill(last.begin(), last.end(), -1); epoch=1; }
+                auto best = argmax_neighbor_indexed_(a_on, a_pop, ixF, sim_thresh_local, acc, last, touched, epoch);
+                if (best.pos < 0) continue;
+                // Build + sort small candidate list to reduce contention
+                struct Cand{int pos; double T;};
+                vector<Cand> cands; cands.reserve(min((int)touched.size(), 32));
+                const double one_plus_t = 1.0 + sim_thresh_local;
+                for (int pos : touched) {
+                    int c = acc[pos]; int b_pop = ixF.pop[pos];
+                    int cmin = (int)ceil( (sim_thresh_local * (a_pop + b_pop)) / one_plus_t );
+                    if (c < cmin) continue;
+                    double Ts = double(c) / double(a_pop + b_pop - c);
+                    if (Ts >= sim_thresh_local) cands.push_back({pos, Ts});
+                }
+                if (cands.empty()) continue;
+                partial_sort(cands.begin(), cands.begin()+min<int>(8,cands.size()), cands.end(),
+                              [](const Cand& x, const Cand& y){ return x.T > y.T; });
+                int keep_j=-1; double keep_T=-1.0;
+                for (size_t h=0; h<cands.size() && h<8; ++h) {
+                    int pos = cands[h].pos;
+                    uint8_t expected = 1;
+                    if (fAvail[pos].compare_exchange_strong(expected, (uint8_t)0)) {
+                        keep_j = ixF.pos2idx[pos];
+                        keep_T = cands[h].T;
+                        break;
+                    }
+                }
+                if (keep_j >= 0) {
+                    std::lock_guard<std::mutex> lk(outMutex);
+                    pairs.emplace_back(iP, keep_j, keep_T);
+                }
+            }
+        };
+        for (int t=0;t<T;++t) ths.emplace_back(worker);
+        for (auto& th : ths) th.join();
         return pairs;
     }
     
@@ -4062,7 +3881,7 @@ public:
             }
             
             // Generate 2D prevalence
-            vector<tuple<int, int, double>> pairs_loo = make_pairs_balanced_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh, 0, 0);  // PERF: Add num_threads=0 (default)
+            vector<tuple<int, int, double>> pairs_loo = make_pairs_balanced_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh, 0);
             map<string, double> E2_loo_raw = build_2d_ftp_stats(smiles_loo, labels_loo, pairs_loo, radius, E1_loo_raw, stat_2d, 0.5);
             map<string, map<string, double>> E2_loo = {{"PASS", {}}, {"FAIL", {}}};
             
@@ -4079,7 +3898,7 @@ public:
             }
             
             // Generate 3D prevalence
-            vector<tuple<int, int, int, double, double>> trips_loo = make_triplets_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh, 0);  // PERF: Add num_threads=0 (default)
+            vector<tuple<int, int, int, double, double>> trips_loo = make_triplets_cpp(smiles_loo, labels_loo, 2, 2048, sim_thresh);
             map<string, double> E3_loo_raw = build_3d_ftp_stats(smiles_loo, labels_loo, trips_loo, radius, E1_loo_raw, stat_3d, 0.5);
             map<string, map<string, double>> E3_loo = {{"PASS", {}}, {"FAIL", {}}};
             
@@ -4255,9 +4074,6 @@ public:
             }
         };
         
-        // PERF: Release GIL only during parallel computation
-        py::gil_scoped_release nogil;
-        
         // Launch threads
         vector<thread> threads;
         threads.reserve(T);
@@ -4271,116 +4087,8 @@ public:
         
         // Wait for completion
         for (auto& th : threads) th.join();
-        // GIL automatically reacquired when nogil goes out of scope
         
         return all_keys;
-    }
-
-    // THREADED: Build 2D pair key counts (separate from 1D keys)
-    // Returns (molecule_count_map, total_count_map) for 2D pair keys like "A|B"
-    tuple<map<string, int>, map<string, int>> build_2d_pair_key_counts_threaded(
-        const vector<string>& smiles,
-        int radius,
-        const unordered_set<string>& allowed_pairs,  // Union of prevalence_data_2d_full PASS/FAIL keys
-        int num_threads = 0
-    ) {
-        const int n = smiles.size();
-        
-        // Determine number of threads
-        const int hw = (int)std::thread::hardware_concurrency();
-        const int T = (num_threads > 0) ? num_threads : (hw > 0 ? hw : 4);
-        
-        // Precompute anchors once (shared across threads)
-        auto anchors_cache = build_anchor_cache(smiles, radius);
-        
-        // Thread-local maps
-        vector<map<string, int>> tl_mol(T);
-        vector<map<string, int>> tl_tot(T);
-        
-        // Worker function
-        auto worker = [&](int tid, int start, int end) {
-            for (int i = start; i < end; ++i) {
-                const auto& anchors = anchors_cache[i];
-                
-                // Collect present 1D keys for this molecule
-                vector<pair<string, const vector<int>*>> present;
-                present.reserve(anchors.size());
-                for (const auto& kv : anchors) {
-                    present.emplace_back(kv.first, &kv.second);
-                }
-                
-                // Generate overlapping pairs
-                unordered_set<string> mol_pairs;
-                mol_pairs.reserve(64);
-                
-                for (size_t a = 0; a < present.size(); ++a) {
-                    for (size_t b = a + 1; b < present.size(); ++b) {
-                        // Overlap test (anchors are sorted)
-                        const auto& Sa = *present[a].second;
-                        const auto& Sb = *present[b].second;
-                        
-                        size_t ia = 0, ib = 0;
-                        bool overlap = false;
-                        while (ia < Sa.size() && ib < Sb.size()) {
-                            if (Sa[ia] == Sb[ib]) {
-                                overlap = true;
-                                break;
-                            }
-                            if (Sa[ia] < Sb[ib]) ia++;
-                            else ib++;
-                        }
-                        
-                        if (!overlap) continue;
-                        
-                        // Build pair key (lexicographic order)
-                        const string& A = present[a].first;
-                        const string& B = present[b].first;
-                        string pairKey = (A < B) ? (A + "|" + B) : (B + "|" + A);
-                        
-                        // Only count if it's in allowed_pairs
-                        if (allowed_pairs.find(pairKey) != allowed_pairs.end()) {
-                            mol_pairs.insert(pairKey);
-                        }
-                    }
-                }
-                
-                // Update counts (once per molecule per key)
-                for (const auto& p : mol_pairs) {
-                    tl_mol[tid][p] += 1;  // molecule-level presence
-                    tl_tot[tid][p] += 1;  // same as mol-level here (pairs are binary per molecule)
-                }
-            }
-        };
-        
-        // Launch threads
-        vector<thread> threads;
-        threads.reserve(T);
-        int chunk = (n + T - 1) / T;
-        int s = 0;
-        for (int t = 0; t < T; ++t) {
-            int e = min(n, s + chunk);
-            if (s >= e) break;
-            threads.emplace_back(worker, t, s, e);
-            s = e;
-        }
-        
-        // Wait for completion
-        for (auto& th : threads) th.join();
-        
-        // Merge thread-local maps
-        map<string, int> mol_count;
-        map<string, int> tot_count;
-        
-        for (int t = 0; t < (int)threads.size(); ++t) {
-            for (const auto& kv : tl_mol[t]) {
-                mol_count[kv.first] += kv.second;
-            }
-            for (const auto& kv : tl_tot[t]) {
-                tot_count[kv.first] += kv.second;
-            }
-        }
-        
-        return {mol_count, tot_count};
     }
 
     // THREADED: build_1d_ftp_stats - Parallel key extraction and counting
@@ -4396,9 +4104,9 @@ public:
         const int hw = (int)std::thread::hardware_concurrency();
         const int T = (num_threads > 0) ? num_threads : (hw > 0 ? hw : 4);
         
-        // Thread-local count maps
-        vector<map<string, int>> thread_a_counts(T);
-        vector<map<string, int>> thread_b_counts(T);
+        // Thread-local count maps (PACKED keys -> int)
+        vector<unordered_map<uint64_t, int>> thread_a_counts(T);
+        vector<unordered_map<uint64_t, int>> thread_b_counts(T);
         vector<int> thread_pass_total(T, 0);
         vector<int> thread_fail_total(T, 0);
         
@@ -4410,30 +4118,53 @@ public:
             int& local_fail = thread_fail_total[thread_id];
             
             for (int i = start; i < end; ++i) {
-                auto keys = get_motif_keys(smiles[i], radius);
+                // PACKED key extraction (faster than string builds)
+                vector<uint64_t> keys;
+                try {
+                    ROMol* mol = SmilesToMol(smiles[i]);
+                    if (mol) {
+                        std::vector<boost::uint32_t>* invariants = nullptr;
+                        const std::vector<boost::uint32_t>* fromAtoms = nullptr;
+                        MorganFingerprints::BitInfoMap bitInfo;
+                        auto *siv = MorganFingerprints::getFingerprint(
+                            *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
+                            false, true, true, false, &bitInfo, false);
+                        for (const auto& kv : bitInfo) {
+                            uint32_t bit = kv.first;
+                            const auto& hits = kv.second;
+                            if (!hits.empty()) {
+                                uint32_t depth = hits[0].second;
+                                keys.push_back(pack_key(bit, depth));
+                            }
+                        }
+                        if (siv) delete siv;
+                        delete mol;
+                    }
+                } catch (...) {}
+                
                 if (labels[i] == 1) {
                     local_pass++;
-                    for (const string& key : keys) {
+                    for (auto pk : keys) {
                         switch (counting_method) {
                             case CountingMethod::COUNTING:
-                                local_a[key]++;
+                                local_a[pk]++;
                                 break;
                             case CountingMethod::BINARY_PRESENCE:
                             case CountingMethod::WEIGHTED_PRESENCE:
-                                local_a[key] = 1;
+                                local_a[pk] = 1;
                                 break;
                         }
                     }
                 } else {
                     local_fail++;
-                    for (const string& key : keys) {
+                    for (auto pk : keys) {
                         switch (counting_method) {
                             case CountingMethod::COUNTING:
-                                local_b[key]++;
+                                local_b[pk]++;
                                 break;
                             case CountingMethod::BINARY_PRESENCE:
                             case CountingMethod::WEIGHTED_PRESENCE:
-                                local_b[key] = 1;
+                                local_b[pk] = 1;
                                 break;
                         }
                     }
@@ -4453,10 +4184,10 @@ public:
         }
         
         for (auto& th : threads) th.join();
-        // GIL automatically reacquired when nogil goes out of scope
         
-        // Merge thread-local counts (single-threaded, fast enough)
-        map<string, int> a_counts, b_counts;
+        // Merge packed maps then convert to strings once
+        unordered_map<uint64_t,int> a_counts_p, b_counts_p;
+        a_counts_p.reserve(200000); b_counts_p.reserve(200000);
         int pass_total = 0, fail_total = 0;
         
         for (int t = 0; t < T; ++t) {
@@ -4465,24 +4196,29 @@ public:
             for (const auto& kv : thread_a_counts[t]) {
                 if (counting_method == CountingMethod::BINARY_PRESENCE || 
                     counting_method == CountingMethod::WEIGHTED_PRESENCE) {
-                    // For binary presence, just mark as present (don't sum across threads)
-                    a_counts[kv.first] = 1;
+                    a_counts_p[kv.first] = 1;
                 } else {
-                    // For counting, sum across threads
-                    a_counts[kv.first] += kv.second;
+                    a_counts_p[kv.first] += kv.second;
                 }
             }
             for (const auto& kv : thread_b_counts[t]) {
                 if (counting_method == CountingMethod::BINARY_PRESENCE || 
                     counting_method == CountingMethod::WEIGHTED_PRESENCE) {
-                    // For binary presence, just mark as present (don't sum across threads)
-                    b_counts[kv.first] = 1;
+                    b_counts_p[kv.first] = 1;
                 } else {
-                    // For counting, sum across threads
-                    b_counts[kv.first] += kv.second;
+                    b_counts_p[kv.first] += kv.second;
                 }
             }
         }
+        
+        // Convert packed -> string only once for scoring/output
+        map<string,int> a_counts, b_counts;
+        auto to_str = [](uint64_t pk){
+            uint32_t bit, depth; unpack_key(pk, bit, depth);
+            return "(" + to_string(bit) + ", " + to_string(depth) + ")";
+        };
+        for (auto& kv: a_counts_p) a_counts[to_str(kv.first)] = kv.second;
+        for (auto& kv: b_counts_p) b_counts[to_str(kv.first)] = kv.second;
         
         // Scoring phase (complete copy from sequential version to ensure identical behavior)
         map<string, double> prevalence_1d;
@@ -4660,15 +4396,12 @@ private:
     vector<map<string, map<string, double>>> prevalence_data_3d_per_task_;
     
     // Key-LOO: Store key counts per task (counted on measured molecules only!)
-    vector<map<string, int>> key_molecule_count_per_task_;  // 1D keys
-    vector<map<string, int>> key_total_count_per_task_;      // 1D keys
-    vector<map<string, int>> key_molecule_count_2d_per_task_;  // NEW: 2D pair keys
-    vector<map<string, int>> key_total_count_2d_per_task_;     // NEW: 2D pair keys
+    vector<map<string, int>> key_molecule_count_per_task_;
+    vector<map<string, int>> key_total_count_per_task_;
     vector<int> n_measured_per_task_;  // Number of measured molecules per task
-    int k_threshold_;  // Key-LOO threshold (default: 1, keeps all keys)
+    int k_threshold_;  // Key-LOO threshold (default: 2, matching Python)
     bool use_key_loo_;  // NEW: Enable/disable Key-LOO filtering (true=Key-LOO, false=Dummy-Masking)
     bool verbose_;  // NEW: Enable/disable verbose output
-    double loo_smoothing_tau_;  // NEW: Smoothing parameter for LOO rescaling (tau in (k_j-1+tau)/(k_j+tau))
     
     bool is_fitted_;
     
@@ -4692,14 +4425,11 @@ public:
         int num_threads = 0,
         CountingMethod counting_method = CountingMethod::COUNTING,
         bool use_key_loo = true,  // NEW: Enable/disable Key-LOO filtering
-        bool verbose = true,  // NEW: Enable/disable verbose output
-        int k_threshold = 2,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=2 filters singletons
-        double loo_smoothing_tau = 1.0  // NEW: Smoothing parameter for LOO rescaling. tau=1.0 means singletons get factor 0.5 instead of 0
+        bool verbose = true  // NEW: Enable/disable verbose output
     ) : radius_(radius), nBits_(nBits), sim_thresh_(sim_thresh),
         stat_1d_(stat_1d), stat_2d_(stat_2d), stat_3d_(stat_3d),
         alpha_(alpha), num_threads_(num_threads), counting_method_(counting_method),
-        k_threshold_(k_threshold), use_key_loo_(use_key_loo), verbose_(verbose), 
-        loo_smoothing_tau_(loo_smoothing_tau), is_fitted_(false) {}  // Fix initialization order
+        k_threshold_(2), use_key_loo_(use_key_loo), verbose_(verbose), is_fitted_(false) {}  // Fix initialization order
     
     // Build prevalence for all tasks
     void fit(
@@ -4731,8 +4461,6 @@ public:
         prevalence_data_3d_per_task_.resize(n_tasks_);
         key_molecule_count_per_task_.resize(n_tasks_);
         key_total_count_per_task_.resize(n_tasks_);
-        key_molecule_count_2d_per_task_.resize(n_tasks_);  // NEW: Separate 2D counts
-        key_total_count_2d_per_task_.resize(n_tasks_);     // NEW: Separate 2D counts
         n_measured_per_task_.resize(n_tasks_);
         
         if (verbose_) {
@@ -4794,7 +4522,7 @@ public:
             // Build pairs for 2D
             // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
             auto pairs = task_generators_[task_idx].make_pairs_balanced_cpp(
-                smiles_task, labels_task, 2, nBits_, sim_thresh_, 0, num_threads_  // PERF: Pass num_threads
+                smiles_task, labels_task, 2, nBits_, sim_thresh_, 0
             );
             auto prev_2d = task_generators_[task_idx].build_2d_ftp_stats(
                 smiles_task, labels_task, pairs, radius_, prev_1d, stat_2d_, alpha_
@@ -4804,7 +4532,7 @@ public:
             // Build triplets for 3D
             // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
             auto triplets = task_generators_[task_idx].make_triplets_cpp(
-                smiles_task, labels_task, 2, nBits_, sim_thresh_, num_threads_  // PERF: Pass num_threads
+                smiles_task, labels_task, 2, nBits_, sim_thresh_
             );
             auto prev_3d = task_generators_[task_idx].build_3d_ftp_stats(
                 smiles_task, labels_task, triplets, radius_, prev_1d, stat_3d_, alpha_
@@ -4847,8 +4575,6 @@ public:
             // Key-LOO: Count keys on measured molecules only (ONLY if use_key_loo_ is true!)
             if (use_key_loo_) {
                 cout << "  Counting keys for Key-LOO filtering...\n";
-                
-                // Count 1D keys
                 auto all_keys = task_generators_[task_idx].get_all_motif_keys_batch_threaded(
                     smiles_task, radius_, num_threads_
                 );
@@ -4869,24 +4595,12 @@ public:
                 
                 key_molecule_count_per_task_[task_idx] = key_mol_count;
                 key_total_count_per_task_[task_idx] = key_tot_count;
-                
-                // FIXED: 2D prevalence uses SINGLE keys (not pair keys), so use 1D counts for 2D filtering
-                // build_2d_ftp_stats builds prevalence using single keys like "(bit, depth)" that are discordant
-                // between PASS-FAIL molecule pairs, not pair keys like "A|B"
-                cout << "  Using 1D key counts for 2D filtering (2D prevalence uses single keys)...\n";
-                
-                // Reuse 1D counts for 2D (they're the same keys!)
-                key_molecule_count_2d_per_task_[task_idx] = key_molecule_count_per_task_[task_idx];
-                key_total_count_2d_per_task_[task_idx] = key_total_count_per_task_[task_idx];
-                
                 n_measured_per_task_[task_idx] = n_measured;
             } else {
                 cout << "  Skipping Key-LOO filtering (Dummy-Masking mode)...\n";
                 // For Dummy-Masking: No Key-LOO, so leave counts empty
                 key_molecule_count_per_task_[task_idx] = {};
                 key_total_count_per_task_[task_idx] = {};
-                key_molecule_count_2d_per_task_[task_idx] = {};
-                key_total_count_2d_per_task_[task_idx] = {};
                 n_measured_per_task_[task_idx] = 0;  // Not used in Dummy-Masking
             }
             
@@ -4987,26 +4701,22 @@ public:
             if (use_key_loo_) {
                 // Key-LOO: Filter keys based on occurrence counts
                 // FIXED: Only apply rescaling for training molecules, never at inference
-                // FIXED: Use separate 2D counts (not 1D counts!)
                 result_tuple = task_generators_[task_idx].build_vectors_with_key_loo_fixed(
                     smiles, radius_,
                     prevalence_data_1d_per_task_[task_idx],
                     prevalence_data_2d_per_task_[task_idx],
                     prevalence_data_3d_per_task_[task_idx],
-                    key_molecule_count_per_task_[task_idx],      // 1D counts
-                    key_total_count_per_task_[task_idx],          // 1D counts
-                    key_molecule_count_2d_per_task_[task_idx],   // FIXED: 2D uses 1D counts (2D prevalence uses single keys!)
-                    key_total_count_2d_per_task_[task_idx],      // FIXED: 2D uses 1D counts (2D prevalence uses single keys!)
-                    key_molecule_count_per_task_[task_idx],      // 3D uses 1D counts (by design)
-                    key_total_count_per_task_[task_idx],          // 3D uses 1D counts (by design)
+                    key_molecule_count_per_task_[task_idx],
+                    key_total_count_per_task_[task_idx],
+                    key_molecule_count_per_task_[task_idx],
+                    key_total_count_per_task_[task_idx],
+                    key_molecule_count_per_task_[task_idx],
+                    key_total_count_per_task_[task_idx],
                     n_measured_per_task_[task_idx],
                     k_threshold_,
                     apply_key_loo_rescaling,  // FIXED: Only true for training, false for inference
                     "max",  // FIXED: Match Python PrevalenceGenerator default
-                    1.0,
-                    loo_smoothing_tau_,  // NEW: Smoothed LOO rescaling (tau=1.0 prevents singleton zeroing)
-                    train_row_mask,  // NEW: Per-molecule training mask for rescaling
-                    num_threads_  // NEW: Pass num_threads_ for OpenMP parallelization
+                    1.0
                 );
             } else {
                 // Dummy-Masking: Simple prevalence, NO Key-LOO filtering!
@@ -5027,10 +4737,7 @@ public:
                     0,  // k_threshold = 0 (disabled)
                     false,  // rescale_n_minus_k = false (no rescaling)
                     "max",  // FIXED: Match Python PrevalenceGenerator default
-                    1.0,
-                    loo_smoothing_tau_,  // Not used when rescaling is disabled, but keep for consistency
-                    nullptr,  // train_row_mask = nullptr (no rescaling for Dummy-Masking)
-                    num_threads_  // NEW: Pass num_threads_ for OpenMP parallelization
+                    1.0
                 );
             }
             
@@ -5188,29 +4895,21 @@ public:
             prevalence_data_3d_per_task_,
             key_molecule_count_per_task_,
             key_total_count_per_task_,
-            key_molecule_count_2d_per_task_,  // NEW: 2D counts
-            key_total_count_2d_per_task_,     // NEW: 2D counts
             n_measured_per_task_,
             k_threshold_,
             use_key_loo_,
             verbose_,
-            loo_smoothing_tau_,  // NEW: Include smoothing parameter
             is_fitted_
         );
     }
     
     // Pickle support: __setstate__
     void __setstate__(py::tuple t) {
-        // Read n_tasks_ first (needed for backward compatibility check)
-        n_tasks_ = t[0].cast<int>();
-        
-        // Updated size: was 21, now 24 (added 2D counts + loo_smoothing_tau)
-        // Old formats: 21 (original), 23 (with 2D counts)
-        bool is_old_format_21 = (t.size() == 21);
-        bool is_old_format_23 = (t.size() == 23);
-        if (t.size() != 24 && !is_old_format_21 && !is_old_format_23) {
+        if (t.size() != 21) {
             throw std::runtime_error("Invalid state for MultiTaskPrevalenceGenerator!");
         }
+        
+        n_tasks_ = t[0].cast<int>();
         radius_ = t[1].cast<int>();
         nBits_ = t[2].cast<int>();
         sim_thresh_ = t[3].cast<double>();
@@ -5226,42 +4925,11 @@ public:
         prevalence_data_3d_per_task_ = t[13].cast<vector<map<string, map<string, double>>>>();
         key_molecule_count_per_task_ = t[14].cast<vector<map<string, int>>>();
         key_total_count_per_task_ = t[15].cast<vector<map<string, int>>>();
-        
-        if (is_old_format_21) {
-            // Old format (21 items) - initialize 2D counts as empty, use default tau=1.0
-            key_molecule_count_2d_per_task_.resize(n_tasks_);
-            key_total_count_2d_per_task_.resize(n_tasks_);
-            for (int i = 0; i < n_tasks_; i++) {
-                key_molecule_count_2d_per_task_[i] = {};
-                key_total_count_2d_per_task_[i] = {};
-            }
-            n_measured_per_task_ = t[16].cast<vector<int>>();
-            k_threshold_ = t[17].cast<int>();
-            use_key_loo_ = t[18].cast<bool>();
-            verbose_ = t[19].cast<bool>();
-            loo_smoothing_tau_ = 1.0;  // Default value
-            is_fitted_ = t[20].cast<bool>();
-        } else if (is_old_format_23) {
-            // Format with 2D counts but no loo_smoothing_tau
-            key_molecule_count_2d_per_task_ = t[16].cast<vector<map<string, int>>>();
-            key_total_count_2d_per_task_ = t[17].cast<vector<map<string, int>>>();
-            n_measured_per_task_ = t[18].cast<vector<int>>();
-            k_threshold_ = t[19].cast<int>();
-            use_key_loo_ = t[20].cast<bool>();
-            verbose_ = t[21].cast<bool>();
-            loo_smoothing_tau_ = 1.0;  // Default value
-            is_fitted_ = t[22].cast<bool>();
-        } else {
-            // New format (24 items) with 2D counts + loo_smoothing_tau
-            key_molecule_count_2d_per_task_ = t[16].cast<vector<map<string, int>>>();
-            key_total_count_2d_per_task_ = t[17].cast<vector<map<string, int>>>();
-            n_measured_per_task_ = t[18].cast<vector<int>>();
-            k_threshold_ = t[19].cast<int>();
-            use_key_loo_ = t[20].cast<bool>();
-            verbose_ = t[21].cast<bool>();
-            loo_smoothing_tau_ = t[22].cast<double>();
-            is_fitted_ = t[23].cast<bool>();
-        }
+        n_measured_per_task_ = t[16].cast<vector<int>>();
+        k_threshold_ = t[17].cast<int>();
+        use_key_loo_ = t[18].cast<bool>();
+        verbose_ = t[19].cast<bool>();
+        is_fitted_ = t[20].cast<bool>();
         
         // Reconstruct task_generators_ (they don't need to store state, just need to exist)
         task_generators_.clear();
@@ -5312,88 +4980,17 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("smiles"), py::arg("radius"))
         .def("get_all_motif_keys_batch", &VectorizedFTPGenerator::get_all_motif_keys_batch,
              py::arg("smiles"), py::arg("radius"))
-        .def("build_3view_vectors_batch",
-             [](VectorizedFTPGenerator& self,
-                const vector<string>& smiles, int radius,
-                const map<string, map<string, double>>& prevalence_data_1d,
-                const map<string, map<string, double>>& prevalence_data_2d,
-                const map<string, map<string, double>>& prevalence_data_3d,
-                double atom_gate, const string& atom_aggregation, double softmax_temperature,
-                py::object train_row_mask_py) {
-                 // Convert optional Python arguments to C++ pointers
-                 const vector<bool>* train_mask_ptr = nullptr;
-                 
-                 if (!train_row_mask_py.is_none()) {
-                     vector<bool> train_mask_local;
-                     if (py::isinstance<py::list>(train_row_mask_py)) {
-                         py::list mask_list = train_row_mask_py.cast<py::list>();
-                         train_mask_local.reserve(mask_list.size());
-                         for (size_t i = 0; i < mask_list.size(); i++) {
-                             train_mask_local.push_back(mask_list[i].cast<bool>());
-                         }
-                     } else if (py::isinstance<py::array>(train_row_mask_py)) {
-                         py::array_t<bool> mask_array = train_row_mask_py.cast<py::array_t<bool>>();
-                         auto buf = mask_array.request();
-                         bool* ptr = static_cast<bool*>(buf.ptr);
-                         train_mask_local.assign(ptr, ptr + buf.size);
-                     }
-                     static vector<bool> train_mask_static;  // Keep alive for pointer
-                     train_mask_static = std::move(train_mask_local);
-                     train_mask_ptr = &train_mask_static;
-                 }
-                 
-                 // Scale maps are internal-only (not exposed to Python)
-                 // They're computed and passed internally in build_vectors_with_key_loo_fixed
-                 return self.build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d,
-                                                      atom_gate, atom_aggregation, softmax_temperature,
-                                                      train_mask_ptr, nullptr, nullptr, nullptr, 0);  // num_threads=0 (auto)
-             },
+        .def("build_3view_vectors_batch", &VectorizedFTPGenerator::build_3view_vectors_batch,
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
-             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
-             py::arg("train_row_mask") = py::none())
+             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
         .def("generate_ftp_vector", &VectorizedFTPGenerator::generate_ftp_vector,
              py::arg("smiles"), py::arg("radius"), py::arg("prevalence_data"), py::arg("atom_gate") = 0.0, 
              py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
-        .def("build_3view_vectors",
-             [](VectorizedFTPGenerator& self,
-                const vector<string>& smiles, int radius,
-                const map<string, map<string, double>>& prevalence_data_1d,
-                const map<string, map<string, double>>& prevalence_data_2d,
-                const map<string, map<string, double>>& prevalence_data_3d,
-                double atom_gate, const string& atom_aggregation, double softmax_temperature,
-                py::object train_row_mask_py) {
-                 // Convert optional Python arguments to C++ pointers
-                 const vector<bool>* train_mask_ptr = nullptr;
-                 
-                 if (!train_row_mask_py.is_none()) {
-                     vector<bool> train_mask_local;
-                     if (py::isinstance<py::list>(train_row_mask_py)) {
-                         py::list mask_list = train_row_mask_py.cast<py::list>();
-                         train_mask_local.reserve(mask_list.size());
-                         for (size_t i = 0; i < mask_list.size(); i++) {
-                             train_mask_local.push_back(mask_list[i].cast<bool>());
-                         }
-                     } else if (py::isinstance<py::array>(train_row_mask_py)) {
-                         py::array_t<bool> mask_array = train_row_mask_py.cast<py::array_t<bool>>();
-                         auto buf = mask_array.request();
-                         bool* ptr = static_cast<bool*>(buf.ptr);
-                         train_mask_local.assign(ptr, ptr + buf.size);
-                     }
-                     static vector<bool> train_mask_static;  // Keep alive for pointer
-                     train_mask_static = std::move(train_mask_local);
-                     train_mask_ptr = &train_mask_static;
-                 }
-                 
-                 // Scale maps are internal-only (not exposed to Python)
-                 return self.build_3view_vectors(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d,
-                                                atom_gate, atom_aggregation, softmax_temperature,
-                                                train_mask_ptr, nullptr, nullptr, nullptr);
-             },
+        .def("build_3view_vectors", &VectorizedFTPGenerator::build_3view_vectors,
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
-             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
-             py::arg("train_row_mask") = py::none())
+             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
         .def("build_3view_vectors_mode", &VectorizedFTPGenerator::build_3view_vectors_mode,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
@@ -5415,10 +5012,10 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("triplets_per_anchor") = 2, py::arg("neighbor_max_use") = 15)
         .def("make_triplets_cpp", &VectorizedFTPGenerator::make_triplets_cpp,
              py::arg("smiles"), py::arg("labels"), py::arg("fp_radius") = 2,
-             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85, py::arg("num_threads") = 0)  // PERF: Add num_threads
+             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85)
         .def("make_pairs_balanced_cpp", &VectorizedFTPGenerator::make_pairs_balanced_cpp,
              py::arg("smiles"), py::arg("labels"), py::arg("fp_radius") = 2,
-             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85, py::arg("seed") = 0, py::arg("num_threads") = 0)  // PERF: Add num_threads
+             py::arg("nBits") = 2048, py::arg("sim_thresh") = 0.85, py::arg("seed") = 0)
         .def("build_cv_vectors_with_dummy_masking", &VectorizedFTPGenerator::build_cv_vectors_with_dummy_masking,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
              py::arg("prevalence_data_1d_full"), py::arg("prevalence_data_2d_full"), py::arg("prevalence_data_3d_full"),
@@ -5441,9 +5038,6 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("n_molecules_full"),
              py::arg("k_threshold") = 1, py::arg("rescale_n_minus_k") = false, 
              py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
-             py::arg("loo_smoothing_tau") = 1.0,  // NEW: Smoothing parameter for LOO rescaling
-             py::arg("train_row_mask") = py::none(),  // NEW: Per-molecule training mask for rescaling
-             py::arg("num_threads") = 0,  // NEW: Number of threads for OpenMP parallelization (0=auto)
              "Fixed Key-LOO that works for inference on new data (batch-independent)")
         .def("build_vectors_with_efficient_key_loo", &VectorizedFTPGenerator::build_vectors_with_efficient_key_loo,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
@@ -5472,7 +5066,7 @@ PYBIND11_MODULE(_molftp, m) {
     
     // Multi-Task Prevalence Generator bindings
     py::class_<MultiTaskPrevalenceGenerator>(m, "MultiTaskPrevalenceGenerator")
-        .def(py::init<int, int, double, string, string, string, double, int, CountingMethod, bool, bool, int, double>(),
+        .def(py::init<int, int, double, string, string, string, double, int, CountingMethod, bool, bool>(),
              py::arg("radius") = 6,
              py::arg("nBits") = 2048,
              py::arg("sim_thresh") = 0.5,
@@ -5484,8 +5078,6 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("counting_method") = CountingMethod::COUNTING,
              py::arg("use_key_loo") = true,  // NEW: Enable/disable Key-LOO (true=Key-LOO, false=Dummy-Masking)
              py::arg("verbose") = false,  // NEW: Enable/disable verbose output
-             py::arg("k_threshold") = 2,  // NEW: Key-LOO threshold (inclusive: >= k_threshold). Default=2 filters singletons
-             py::arg("loo_smoothing_tau") = 1.0,  // NEW: Smoothing parameter for LOO rescaling (tau=1.0 prevents singleton zeroing)
              "Initialize Multi-Task Prevalence Generator\n"
              "use_key_loo=True: Key-LOO filtering (for Key-LOO multi-task)\n"
              "use_key_loo=False: Simple prevalence, no filtering (for Dummy-Masking)\n"

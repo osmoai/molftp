@@ -1,0 +1,157 @@
+[17:18:14] Can't kekulize mol.  Unkekulized atoms: 0 1 2 3 4 5 6 7 8
+  Measured samples: 2307 (100%)
+  Positive: 1081 (46.8574%)
+  Negative: 1226 (53.1426%)
+  Building 1D prevalence...
+  Building 2D prevalence...
+  Building 3D prevalence...
+  Skipping Key-LOO filtering (Dummy-Masking mode)...
+  ✅ Prevalence built for biodegradation
+
+================================================================================
+✅ ALL TASK PREVALENCE BUILT (C++)!
+================================================================================
+Total tasks: 1
+Features per task: 27 (1D + 2D + 3D)
+Total features: 27
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 2307
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (biodegradation)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 2: N_full=2 N_train=2 factor=1 PASS_orig=0.687759 PASS_corrected=0.687759
+✅ (27 features, masked 4008 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (2307, 27)
+================================================================================
+[17:18:15] Can't kekulize mol.  Unkekulized atoms: 0 1 2 3 4 5 6 7 8
+  Measured samples: 2307 (100%)
+  Positive: 1081 (46.8574%)
+  Negative: 1226 (53.1426%)
+  Building 1D prevalence...
+  Building 2D prevalence...
+  Building 3D prevalence...
+  Skipping Key-LOO filtering (Dummy-Masking mode)...
+  ✅ Prevalence built for biodegradation
+
+================================================================================
+✅ ALL TASK PREVALENCE BUILT (C++)!
+================================================================================
+Total tasks: 1
+Features per task: 27 (1D + 2D + 3D)
+Total features: 27
+================================================================================
+
+================================================================================
+TRANSFORMING WITH DUMMY-MASKING (C++)
+================================================================================
+Molecules: 2307
+Total features: 27
+Method: Dummy-Masking (mask test-only keys)
+  Task 1/1 (biodegradation)...       DEBUG 1D key 0: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 1: N_full=1 N_train=1 factor=1 PASS_orig=0.371646 PASS_corrected=0.371646
+      DEBUG 1D key 2: N_full=2 N_train=2 factor=1 PASS_orig=0.687759 PASS_corrected=0.687759
+✅ (27 features, masked 4008 1D keys)
+
+✅ Multi-task Dummy-Masking features created (C++):
+   Shape: (2307, 27)
+================================================================================
+[17:18:16] Can't kekulize mol.  Unkekulized atoms: 0 1 2 3 4 5 6 7 8
+
+================================================================================
+MOLFTP BIODEGRADATION DATASET TEST
+================================================================================
+MolFTP Version: 1.6.0
+================================================================================
+
+
+
+================================================================================
+MOLFTP SPEED TEST - DUMMY_MASKING
+================================================================================
+
+[Loading biodegradation dataset...]
+  ✓ Loaded 2307 molecules
+
+[Timing fit()...]
+[Timing transform()...]
+
+================================================================================
+TIMING RESULTS
+================================================================================
+
+⏱️  Fit time:        0.3784s (2307 molecules)
+⏱️  Transform time:  0.5501s
+⏱️  Total time:      0.9286s
+⚡ Throughput:      2484.5 molecules/s
+
+
+
+================================================================================
+MOLFTP PERFORMANCE TEST - DUMMY_MASKING
+================================================================================
+
+[Loading biodegradation dataset...]
+  ✓ Loaded 2307 molecules
+  ✓ Positive: 1081 (46.9%)
+  ✓ Negative: 1226 (53.1%)
+
+[Data split]
+  Train: 1845 molecules
+  Valid: 462 molecules
+
+[Initializing MolFTP (dummy_masking)...]
+  ✓ Features shape: 27 features per molecule
+
+[Training Random Forest classifier...]
+
+[Making predictions...]
+
+[Computing metrics...]
+
+================================================================================
+RESULTS
+================================================================================
+
+📊 Training Set Metrics:
+  PR-AUC:        1.0000
+  ROC-AUC:       1.0000
+  Balanced Acc:  0.9990
+  Precision:     0.9977
+  Recall:        1.0000
+  F1-Score:      0.9988
+  Confusion Matrix: TN=978, FP=2, FN=0, TP=865
+
+📊 Validation Set Metrics:
+  PR-AUC:        0.8726
+  ROC-AUC:       0.8987
+  Balanced Acc:  0.8304
+  Precision:     0.7965
+  Recall:        0.8519
+  F1-Score:      0.8233
+  Confusion Matrix: TN=199, FP=47, FN=32, TP=184
+
+
+
+================================================================================
+MOLFTP SPEED TEST - KEY_LOO
+================================================================================
+
+[Loading biodegradation dataset...]
+  ✓ Loaded 2307 molecules
+Traceback (most recent call last):
+  File "/Users/guillaume-osmo/Github/rdkit-pypi/external/molftp/test_biodegradation_speed_metrics.py", line 351, in <module>
+    main()
+  File "/Users/guillaume-osmo/Github/rdkit-pypi/external/molftp/test_biodegradation_speed_metrics.py", line 326, in main
+    speed_keyloo = test_speed('key_loo', k_threshold=2)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/guillaume-osmo/Github/rdkit-pypi/external/molftp/test_biodegradation_speed_metrics.py", line 265, in test_speed
+    gen = molftp.MultiTaskPrevalenceGenerator(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: MultiTaskPrevalenceGenerator.__init__() got an unexpected keyword argument 'key_loo_k'

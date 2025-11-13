@@ -17,7 +17,11 @@
 #include <climits>
 #include <cstdlib>
 
-// RDKit headers before pybind11 to avoid Boost.Python conflicts
+// Include Boost.Python wrap_python.hpp FIRST to handle Python API compatibility
+// This must come before any other Python-related headers
+#include <boost/python/detail/wrap_python.hpp>
+
+// RDKit headers (these include Boost.Python via Python.h)
 #include <RDGeneral/export.h>
 #include <GraphMol/RDKitBase.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
@@ -26,7 +30,7 @@
 #include <DataStructs/ExplicitBitVect.h>
 #include <DataStructs/BitVect.h>
 
-// pybind11 headers last (after RDKit/Boost.Python)
+// pybind11 headers last (after Boost.Python setup)
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>

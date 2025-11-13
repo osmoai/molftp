@@ -4843,19 +4843,88 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("smiles"), py::arg("radius"))
         .def("get_all_motif_keys_batch", &VectorizedFTPGenerator::get_all_motif_keys_batch,
              py::arg("smiles"), py::arg("radius"))
-        .def("build_3view_vectors_batch", &VectorizedFTPGenerator::build_3view_vectors_batch,
+        .def("build_3view_vectors_batch",
+             [](VectorizedFTPGenerator& self,
+                const vector<string>& smiles, int radius,
+                const map<string, map<string, double>>& prevalence_data_1d,
+                const map<string, map<string, double>>& prevalence_data_2d,
+                const map<string, map<string, double>>& prevalence_data_3d,
+                double atom_gate, const string& atom_aggregation, double softmax_temperature,
+                py::object train_row_mask_py) {
+                 // Convert optional Python arguments to C++ pointers
+                 const vector<bool>* train_mask_ptr = nullptr;
+                 
+                 if (!train_row_mask_py.is_none()) {
+                     vector<bool> train_mask_local;
+                     if (py::isinstance<py::list>(train_row_mask_py)) {
+                         py::list mask_list = train_row_mask_py.cast<py::list>();
+                         train_mask_local.reserve(mask_list.size());
+                         for (size_t i = 0; i < mask_list.size(); i++) {
+                             train_mask_local.push_back(mask_list[i].cast<bool>());
+                         }
+                     } else if (py::isinstance<py::array>(train_row_mask_py)) {
+                         py::array_t<bool> mask_array = train_row_mask_py.cast<py::array_t<bool>>();
+                         auto buf = mask_array.request();
+                         bool* ptr = static_cast<bool*>(buf.ptr);
+                         train_mask_local.assign(ptr, ptr + buf.size);
+                     }
+                     static vector<bool> train_mask_static;  // Keep alive for pointer
+                     train_mask_static = std::move(train_mask_local);
+                     train_mask_ptr = &train_mask_static;
+                 }
+                 
+                 // Scale maps are internal-only (not exposed to Python)
+                 // They're computed and passed internally in build_vectors_with_key_loo_fixed
+                 return self.build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d,
+                                                      atom_gate, atom_aggregation, softmax_temperature,
+                                                      train_mask_ptr, nullptr, nullptr, nullptr);
+             },
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
              py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
-             py::arg("train_row_mask") = py::none(), py::arg("scale_1d") = py::none(), 
-             py::arg("scale_2d") = py::none(), py::arg("scale_3d") = py::none())
+             py::arg("train_row_mask") = py::none())
         .def("generate_ftp_vector", &VectorizedFTPGenerator::generate_ftp_vector,
              py::arg("smiles"), py::arg("radius"), py::arg("prevalence_data"), py::arg("atom_gate") = 0.0, 
              py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
-        .def("build_3view_vectors", &VectorizedFTPGenerator::build_3view_vectors,
+        .def("build_3view_vectors",
+             [](VectorizedFTPGenerator& self,
+                const vector<string>& smiles, int radius,
+                const map<string, map<string, double>>& prevalence_data_1d,
+                const map<string, map<string, double>>& prevalence_data_2d,
+                const map<string, map<string, double>>& prevalence_data_3d,
+                double atom_gate, const string& atom_aggregation, double softmax_temperature,
+                py::object train_row_mask_py) {
+                 // Convert optional Python arguments to C++ pointers
+                 const vector<bool>* train_mask_ptr = nullptr;
+                 
+                 if (!train_row_mask_py.is_none()) {
+                     vector<bool> train_mask_local;
+                     if (py::isinstance<py::list>(train_row_mask_py)) {
+                         py::list mask_list = train_row_mask_py.cast<py::list>();
+                         train_mask_local.reserve(mask_list.size());
+                         for (size_t i = 0; i < mask_list.size(); i++) {
+                             train_mask_local.push_back(mask_list[i].cast<bool>());
+                         }
+                     } else if (py::isinstance<py::array>(train_row_mask_py)) {
+                         py::array_t<bool> mask_array = train_row_mask_py.cast<py::array_t<bool>>();
+                         auto buf = mask_array.request();
+                         bool* ptr = static_cast<bool*>(buf.ptr);
+                         train_mask_local.assign(ptr, ptr + buf.size);
+                     }
+                     static vector<bool> train_mask_static;  // Keep alive for pointer
+                     train_mask_static = std::move(train_mask_local);
+                     train_mask_ptr = &train_mask_static;
+                 }
+                 
+                 // Scale maps are internal-only (not exposed to Python)
+                 return self.build_3view_vectors(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d,
+                                                atom_gate, atom_aggregation, softmax_temperature,
+                                                train_mask_ptr, nullptr, nullptr, nullptr);
+             },
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
-             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
+             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
+             py::arg("train_row_mask") = py::none())
         .def("build_3view_vectors_mode", &VectorizedFTPGenerator::build_3view_vectors_mode,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),

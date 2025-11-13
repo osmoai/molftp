@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstdlib>
 
+#include <boost/numeric/conversion/cast.hpp>
 #include <RDGeneral/export.h>
 #include <GraphMol/RDKitBase.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
@@ -58,6 +59,13 @@ private:
         bit   = uint32_t(p >> 8);
     }
     
+    // ---------- Phase 2: Global fingerprint cache ----------
+    struct FPView {
+        vector<int> on;  // on-bits
+        int pop = 0;     // popcount
+    };
+    vector<FPView> fp_global_;   // built once per fit, reused everywhere
+    
     // ---------- Postings index for indexed neighbor search ----------
     struct PostingsIndex {
         int nBits = 2048;
@@ -68,9 +76,84 @@ private:
         vector<vector<int>> onbits;               // on-bits per molecule (positions)
         // Map POSITION -> original index in 'smiles'
         vector<int> pos2idx;                      // size M
+        // Phase 2 additions:
+        vector<int> g2pos;                        // global index -> subset pos (or -1)
+        vector<uint32_t> bit_freq;               // frequency per bit in subset
     };
     
-    // Build postings for a subset of rows (e.g., FAIL or PASS)
+    // Phase 2: Build global fingerprint cache once
+    void build_fp_cache_global_(const vector<string>& smiles, int fp_radius) {
+        const int n = (int)smiles.size();
+        fp_global_.clear();
+        fp_global_.resize(n);
+        const int hw = (int)thread::hardware_concurrency();
+        const int T = (hw>0? hw: 4);
+        atomic<int> next(0);
+        vector<thread> ths;
+        ths.reserve(T);
+        auto worker = [&](){
+            int i;
+            while ((i = next.fetch_add(1)) < n) {
+                ROMol* m=nullptr;
+                try { m = SmilesToMol(smiles[i]); } catch (...) { m=nullptr; }
+                if (!m) continue;
+                unique_ptr<ExplicitBitVect> fp(
+                    MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits));
+                delete m;
+                if (!fp) continue;
+                vector<int> tmp;
+                fp->getOnBits(tmp);
+                auto &dst = fp_global_[i];
+                dst.on = tmp;  // direct assignment
+                dst.pop = (int)tmp.size();
+            }
+        };
+        for (int t=0;t<T;++t) ths.emplace_back(worker);
+        for (auto& th: ths) th.join();
+    }
+    
+    // Phase 2: Build postings from cache (faster, no RDKit calls)
+    PostingsIndex build_postings_from_cache_(const vector<FPView>& fpv,
+                                             const vector<int>& subset,
+                                             bool build_lists = true) {
+        PostingsIndex ix;
+        ix.nBits = nBits;
+        ix.pos2idx = subset;
+        const int m = (int)subset.size();
+        ix.pop.resize(m);
+        ix.onbits.resize(m);
+        ix.g2pos.assign((int)fpv.size(), -1);
+        ix.bit_freq.assign(ix.nBits, 0);
+        
+        // First pass: copy cached onbits/pop + count bit frequencies
+        for (int p=0; p<m; ++p) {
+            int g = subset[p];
+            ix.g2pos[g] = p;
+            const auto& v = fpv[g];
+            ix.pop[p] = v.pop;
+            ix.onbits[p] = v.on;  // copy (small)
+            for (int b : v.on) {
+                if (b>=0 && b<ix.nBits) ix.bit_freq[b] += 1;
+            }
+        }
+        
+        if (!build_lists) return ix;
+        
+        ix.lists.assign(ix.nBits, {});
+        // Reserve to avoid reallocs (Phase 3 optimization)
+        for (int b=0; b<ix.nBits; ++b) {
+            if (ix.bit_freq[b]) ix.lists[b].reserve(ix.bit_freq[b]);
+        }
+        
+        for (int p=0; p<m; ++p) {
+            for (int b : ix.onbits[p]) {
+                if (b>=0 && b<ix.nBits) ix.lists[b].push_back(p);
+            }
+        }
+        return ix;
+    }
+    
+    // Build postings for a subset of rows (e.g., FAIL or PASS) - legacy method
     PostingsIndex build_postings_index_(const vector<string>& smiles,
                                         const vector<int>& subset,
                                         int fp_radius) {
@@ -80,10 +163,13 @@ private:
         ix.pop.resize(subset.size());
         ix.onbits.resize(subset.size());
         ix.pos2idx = subset;
+        ix.g2pos.assign((int)smiles.size(), -1);
+        ix.bit_freq.assign(ix.nBits, 0);
         
         // Precompute on-bits and popcounts, fill postings
         for (size_t p = 0; p < subset.size(); ++p) {
             int j = subset[p];
+            ix.g2pos[j] = (int)p;
             ROMol* m = nullptr;
             try { m = SmilesToMol(smiles[j]); } catch (...) { m = nullptr; }
             if (!m) { ix.pop[p] = 0; continue; }
@@ -91,13 +177,26 @@ private:
             delete m;
             if (!fp) { ix.pop[p] = 0; continue; }
             // Collect on bits once
-            vector<unsigned int> tmp;
+            vector<int> tmp;
             fp->getOnBits(tmp);
             ix.pop[p] = (int)tmp.size();
-            ix.onbits[p].reserve(tmp.size());
-            for (auto b : tmp) {
-                ix.onbits[p].push_back((int)b);
-                ix.lists[b].push_back((int)p); // postings carry POSITION (0..M-1)
+            ix.onbits[p] = tmp;  // direct assignment
+            for (int b : tmp) {
+                if (b >= 0 && b < ix.nBits) {
+                    ix.bit_freq[b] += 1;
+                }
+            }
+        }
+        // Reserve lists based on frequency (Phase 3)
+        for (int b=0; b<ix.nBits; ++b) {
+            if (ix.bit_freq[b]) ix.lists[b].reserve(ix.bit_freq[b]);
+        }
+        // Fill lists
+        for (size_t p = 0; p < subset.size(); ++p) {
+            for (int b : ix.onbits[p]) {
+                if (b >= 0 && b < ix.nBits) {
+                    ix.lists[b].push_back((int)p);
+                }
             }
         }
         return ix;
@@ -154,11 +253,8 @@ private:
     
     // Extract anchor on-bits + popcount once
     static inline void get_onbits_and_pop_(const ExplicitBitVect& fp, vector<int>& onbits, int& pop) {
-        vector<unsigned int> tmp;
-        fp.getOnBits(tmp);
-        onbits.resize(tmp.size());
-        for (size_t i=0;i<tmp.size();++i) onbits[i] = (int)tmp[i];
-        pop = (int)tmp.size();
+        fp.getOnBits(onbits);
+        pop = (int)onbits.size();
     }
     
     // Check if legacy scan should be forced
@@ -2397,9 +2493,14 @@ public:
             return trips;
         }
 
-        // Indexed fast path
-        PostingsIndex ixP = build_postings_index_(smiles, idxP, fp_radius);
-        PostingsIndex ixF = build_postings_index_(smiles, idxF, fp_radius);
+        // Indexed fast path (Phase 2: with cache)
+        // Build global fp cache exactly once
+        if ((int)fp_global_.size() != (int)smiles.size())
+            build_fp_cache_global_(smiles, fp_radius);
+        
+        // Build postings from cache
+        auto ixP = build_postings_from_cache_(fp_global_, idxP, /*build_lists=*/true);
+        auto ixF = build_postings_from_cache_(fp_global_, idxF, /*build_lists=*/true);
 
         vector<tuple<int,int,int,double,double>> trips;
         trips.reserve(n/2);
@@ -2410,21 +2511,30 @@ public:
         atomic<int> next(0);
 
         auto worker = [&](){
-            vector<int> accP(ixP.pop.size(),0), lastP(ixP.pop.size(),-1), touchedP; touchedP.reserve(256);
-            vector<int> accF(ixF.pop.size(),0), lastF(ixF.pop.size(),-1), touchedF; touchedF.reserve(256);
+            vector<int> accP(ixP.pop.size(),0), lastP(ixP.pop.size(),-1), touchedP; touchedP.reserve(512); // Phase 3: increased capacity
+            vector<int> accF(ixF.pop.size(),0), lastF(ixF.pop.size(),-1), touchedF; touchedF.reserve(512); // Phase 3: increased capacity
             int epochP=1, epochF=1;
             while (true) {
                 int i = next.fetch_add(1);
                 if (i>=n) break;
-                ROMol* m=nullptr; try{ m=SmilesToMol(smiles[i]); }catch(...){ m=nullptr; }
-                if (!m) continue;
-                unique_ptr<ExplicitBitVect> fp(MorganFingerprints::getFingerprintAsBitVect(*m, fp_radius, nBits_local));
-                delete m; if (!fp) continue;
-                vector<int> a_on; int a_pop=0; get_onbits_and_pop_(*fp, a_on, a_pop);
+                
+                // Phase 2: Use cached fingerprint instead of recomputing
+                if (i >= (int)fp_global_.size() || fp_global_[i].pop == 0) continue;
+                const auto& a = fp_global_[i];
+                const auto& a_on = a.on;
+                const int a_pop = a.pop;
+                
+                // Phase 3: Rare-first bit ordering per neighbor subset
+                vector<int> a_on_P = a_on;
+                vector<int> a_on_F = a_on;
+                sort(a_on_P.begin(), a_on_P.end(),
+                     [&](int x, int y){ return ixP.bit_freq[x] < ixP.bit_freq[y]; });
+                sort(a_on_F.begin(), a_on_F.end(),
+                     [&](int x, int y){ return ixF.bit_freq[x] < ixF.bit_freq[y]; });
 
                 // PASS candidates (exclude self if PASS)
                 ++epochP; if (epochP==INT_MAX){ fill(lastP.begin(), lastP.end(), -1); epochP=1; }
-                argmax_neighbor_indexed_(a_on, a_pop, ixP, sim_thresh_local, accP, lastP, touchedP, epochP);
+                argmax_neighbor_indexed_(a_on_P, a_pop, ixP, sim_thresh_local, accP, lastP, touchedP, epochP);
                 struct Cand{int pos; double T;};
                 vector<Cand> candP;
                 const double one_plus_t = 1.0 + sim_thresh_local;
@@ -2446,7 +2556,7 @@ public:
 
                 // FAIL candidates
                 ++epochF; if (epochF==INT_MAX){ fill(lastF.begin(), lastF.end(), -1); epochF=1; }
-                argmax_neighbor_indexed_(a_on, a_pop, ixF, sim_thresh_local, accF, lastF, touchedF, epochF);
+                argmax_neighbor_indexed_(a_on_F, a_pop, ixF, sim_thresh_local, accF, lastF, touchedF, epochF);
                 vector<Cand> candF;
                 for (int pos : touchedF) {
                     int c = accF[pos]; int b_pop = ixF.pop[pos];
@@ -3571,8 +3681,15 @@ public:
             return pairs;
         }
 
-        // -------------------- indexed fast path ------------------------
-        PostingsIndex ixF = build_postings_index_(smiles, idxF, fp_radius);
+        // -------------------- indexed fast path (Phase 2: with cache) ------------------------
+        // Build global fp cache exactly once
+        if ((int)fp_global_.size() != (int)smiles.size())
+            build_fp_cache_global_(smiles, fp_radius);
+        
+        // Build postings from cache
+        auto ixF = build_postings_from_cache_(fp_global_, idxF, /*build_lists=*/true);
+        auto ixP = build_postings_from_cache_(fp_global_, idxP, /*build_lists=*/false);
+        
         const int MF = (int)idxF.size();
         vector<atomic<uint8_t>> fAvail(MF);
         for (int p=0;p<MF;++p) fAvail[p].store(1, std::memory_order_relaxed);
@@ -3589,19 +3706,26 @@ public:
         atomic<int> next(0);
 
         auto worker = [&]() {
-            vector<int> acc(MF, 0), last(MF, -1), touched; touched.reserve(256);
+            vector<int> acc(MF, 0), last(MF, -1), touched; touched.reserve(512); // Phase 3: increased capacity
             int epoch = 1;
             for (;;) {
                 int k = next.fetch_add(1);
                 if (k >= (int)order.size()) break;
                 int iP = order[k];
-                ROMol* mP=nullptr; try { mP=SmilesToMol(smiles[iP]); } catch (...) { mP=nullptr; }
-                if (!mP) continue;
-                unique_ptr<ExplicitBitVect> fpP(MorganFingerprints::getFingerprintAsBitVect(*mP, fp_radius, nBits_local));
-                delete mP; if (!fpP) continue;
-                vector<int> a_on; int a_pop=0; get_onbits_and_pop_(*fpP, a_on, a_pop);
+                int posP = ixP.g2pos[iP];
+                if (posP < 0) continue; // should not happen
+                
+                // Phase 2: Use cached fingerprint instead of recomputing
+                const auto& a_on = ixP.onbits[posP];
+                const int a_pop = ixP.pop[posP];
+                
+                // Phase 3: Rare-first bit order to reduce candidates
+                vector<int> a_sorted = a_on;
+                sort(a_sorted.begin(), a_sorted.end(),
+                     [&](int x, int y){ return ixF.bit_freq[x] < ixF.bit_freq[y]; });
+                
                 ++epoch; if (epoch==INT_MAX){ fill(last.begin(), last.end(), -1); epoch=1; }
-                auto best = argmax_neighbor_indexed_(a_on, a_pop, ixF, sim_thresh_local, acc, last, touched, epoch);
+                auto best = argmax_neighbor_indexed_(a_sorted, a_pop, ixF, sim_thresh_local, acc, last, touched, epoch);
                 if (best.pos < 0) continue;
                 // Build + sort small candidate list to reduce contention
                 struct Cand{int pos; double T;};

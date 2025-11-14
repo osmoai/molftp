@@ -16,14 +16,25 @@
 #include <numeric>
 #include <climits>
 #include <cstdlib>
+#include <cstdint>
 
 // Include system Python.h FIRST to establish Python API
-// This prevents pybind11 from including Python.h through RDKit
+// This is critical for both pybind11 and Boost.Python builds
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-// RDKit headers (these include Boost.Python via rdkit/Python.h)
-// But system Python.h is already included, so Boost.Python will use it
+// Prevent RDKit from including its Python.h wrapper when building with pybind11
+// RDKit's rdkit/Python.h includes Boost.Python, which conflicts with pybind11
+// By defining RDKIT_PYTHON_H_ALREADY_INCLUDED, we prevent RDKit from including it
+#ifndef BOOST_PYTHON_BUILD
+#define RDKIT_PYTHON_H_ALREADY_INCLUDED
+// Also prevent Boost.Python from being included via RDKit headers
+#define BOOST_PYTHON_NO_PY_SIGNATURES
+#endif
+
+// RDKit headers (these may try to include rdkit/Python.h, but we've prevented it above)
+// For pybind11 builds: RDKit headers won't include Boost.Python
+// For Boost.Python builds: Python.h is already included, so Boost.Python will use it
 #include <RDGeneral/export.h>
 #include <GraphMol/RDKitBase.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
@@ -32,17 +43,640 @@
 #include <DataStructs/ExplicitBitVect.h>
 #include <DataStructs/BitVect.h>
 
+// Fast prevalence optimization (bitset-based co-occurrence counting)
+#include "../cpp/molftp/bitset.hpp"
+#include "../cpp/molftp/fast_prevalence.hpp"
+
 // pybind11 headers last (system Python.h already included)
+// Only include pybind11 when NOT building Boost.Python
+#ifndef BOOST_PYTHON_BUILD
+// Clean up any Boost.Python macros that might interfere with pybind11
+#undef BOOST_PYTHON_DECL
 // PYBIND11_SIMPLE_GIL_MANAGEMENT is defined in setup.py to avoid conflicts
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <pybind11/iostream.h>
+#endif  // BOOST_PYTHON_BUILD
 
 using namespace RDKit;
 using namespace std;
 
+#ifndef BOOST_PYTHON_BUILD
 namespace py = pybind11;
+#endif  // BOOST_PYTHON_BUILD
+
+// ================================================================
+// NCM / Proximity additions (hierarchical "notclose-masking")
+// ================================================================
+
+// Non-breaking: disabled unless turned on through config.
+enum class ProximityMode : uint8_t { NONE = 0, HIER_MASK = 1, HIER_BACKOFF = 2 };
+
+struct NCMConfig {
+  ProximityMode mode = ProximityMode::NONE;
+  int           dmax = 0;       // distance cap (0 == Dummy-Masking for unseen keys)
+  double        lambda = 0.5;   // decay for backoff
+  bool          train_only = true; // must remain true to avoid leakage
+  int           min_parent_depth = 0;  // do not climb above this depth
+  bool          require_all_components = true;  // for 2D/3D: all components must be close
+};
+
+// Bitmaps of "seen in TRAIN" keys (1D/2D/3D) - using string keys
+struct TrainPresence {
+  std::map<string, bool> seen1d; // string key -> bool
+  std::map<string, bool> seen2d; // string key -> bool
+  std::map<string, bool> seen3d; // string key -> bool
+};
+
+// Minimal subset of state we need at runtime.
+struct NCMStateView {
+  // 1D parents (optional; empty maps => we cannot climb, distance=>INF)
+  const std::map<string, std::vector<string>>* parents_1d = nullptr;     // string key -> vector of parent keys
+  // Quick access sizes
+  size_t K1 = 0, K2 = 0, K3 = 0;
+};
+
+// ================================================================
+// Target-aware amplitude for NCM
+// ================================================================
+enum ProximityAmpSource : uint8_t {
+    PROXAMP_OFF = 0,          // default: no amplitude scaling
+    PROXAMP_TRAIN_SHARE = 1,  // amp = ((ctr + α)/(ctr + cte + 2α))^γ
+    PROXAMP_TARGET_ONLY = 2,  // amp = ((cte + α)/(ctr + cte + 2α))^γ  (optional)
+};
+
+struct NCMAmplitudeParams {
+    ProximityAmpSource source = PROXAMP_OFF;
+    float prior_alpha = 1.0f;     // Laplace α
+    float gamma       = 1.0f;     // sharpness
+    float cap_min     = 0.10f;    // clamp lower
+    float cap_max     = 1.00f;    // clamp upper (≤1 if you want only down-weighting)
+    bool  apply_to_train_rows = false; // usually false (don't scale training rows)
+    bool  first_component_only = false; // default: use min over components (more conservative)
+    float dist_beta = 0.0f;       // 0 = off, else decay by (1/(1+d))^dist_beta
+};
+
+struct NCMCounts {
+    // 1D key → counts
+    std::unordered_map<std::string, int> train_1d;
+    std::unordered_map<std::string, int> target_1d; // filled per transform() call
+};
+
+// ================================================================
+// Statistical Backoff: Apply hierarchical backoff only when key count < threshold
+// ================================================================
+enum class StatisticalBackoffMode : uint8_t {
+    NONE = 0,           // No statistical backoff
+    COUNT_THRESHOLD = 1 // Apply backoff when count < threshold
+};
+
+struct StatisticalBackoffConfig {
+    StatisticalBackoffMode mode = StatisticalBackoffMode::NONE;
+    int threshold = 5;           // Minimum count to use own prevalence
+    int dmax = 1;                 // Maximum distance to climb
+    double lambda = 0.5;          // Decay factor
+    bool use_train_counts = true; // Use training counts (not fit-time counts)
+};
+
+inline float pow_clamped(float base, float exp, float lo, float hi) {
+    float v = std::pow(base, exp);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
+
+// Helper: Distance decay factor: (1/(1+d))^beta
+inline float ncm_distance_decay_factor(int dist, float beta)
+{
+    if (beta <= 0.0f || dist < 0) return 1.0f;
+    if (dist == 0) return 1.0f; // exact match
+    return std::pow(1.0f / (1.0f + static_cast<float>(dist)), beta);
+}
+
+// Forward declaration
+inline int ncm_min_dist_to_train_presence_1d(const std::string& key1d,
+                                             const std::unordered_set<std::string>& train_1d_presence,
+                                             int dmax);
+
+inline float ncm_amplitude_for_key(const std::string& k,
+                                   const NCMCounts& cnt,
+                                   const NCMAmplitudeParams& p,
+                                   const std::unordered_set<std::string>* train_1d_presence = nullptr,
+                                   int dmax = 0)
+{
+    if (p.source == PROXAMP_OFF) return 1.0f;
+
+    const int ctr = (int)(cnt.train_1d.count(k) ? cnt.train_1d.at(k) : 0);
+    const int cte = (int)(cnt.target_1d.count(k) ? cnt.target_1d.at(k) : 0);
+    const float a = p.prior_alpha;
+
+    float numer = (p.source == PROXAMP_TRAIN_SHARE) ? (ctr + a)
+                 : (p.source == PROXAMP_TARGET_ONLY) ? (cte + a)
+                 : (ctr + a); // default fallback
+
+    float denom = (ctr + cte + 2.0f * a);
+    float frac  = denom > 0.0f ? (numer / denom) : 1.0f;
+
+    // ensure 0<frac≤1 if you want only down-weighting
+    if (frac <= 0.0f) frac = p.cap_min;
+
+    float amp = pow_clamped(frac, p.gamma, p.cap_min, p.cap_max);
+    
+    // Apply distance decay if enabled
+    if (p.dist_beta > 0.0f && train_1d_presence && dmax > 0) {
+        int dist = ncm_min_dist_to_train_presence_1d(k, *train_1d_presence, dmax);
+        if (dist <= dmax) {
+            amp *= ncm_distance_decay_factor(dist, p.dist_beta);
+        }
+    }
+    
+    return amp;
+}
+
+// A tiny context object we can pass to fast inline helpers.
+struct NCMContext {
+  const NCMConfig*     cfg = nullptr;
+  const TrainPresence* tp  = nullptr;
+  const NCMStateView*  st  = nullptr;
+  bool is_train_row = false; // true only for training rows (Key-LOO etc.)
+  NCMAmplitudeParams amp;    // Amplitude parameters
+  NCMCounts counts;           // Train and target counts
+};
+
+// ================================================================
+// Forward declarations for fastpath helpers
+// ================================================================
+// Forward declare parse_bitdepth_fast (defined later, outside namespace)
+static inline bool parse_bitdepth_fast(const std::string& s, uint32_t& bit, uint8_t& depth) noexcept;
+
+// ================================================================
+// NCM namespace helpers (hierarchical proximity over (bit,depth) keys)
+// ================================================================
+namespace ncm {
+static constexpr const char* kCompositeSep = "|"; // separator for 2D/3D composite keys
+
+static inline std::string trim(const std::string& s) {
+  size_t b = 0, e = s.size();
+  while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e-1]))) --e;
+  return s.substr(b, e-b);
+}
+
+// Parse "(bit,depth)" → (bit, depth). Accepts optional spaces.
+// FASTPATH: Use parse_bitdepth_fast when possible (no allocations)
+static inline bool parse_bitdepth(const std::string& key, uint32_t* bit, int* depth) {
+  // Try fast path first (no allocations)
+  uint32_t b = 0; uint8_t d = 0;
+  if (parse_bitdepth_fast(key, b, d)) {
+    if (bit) *bit = b;
+    if (depth) *depth = static_cast<int>(d);
+    return true;
+  }
+  // Fallback to slow path (for malformed keys)
+  std::string s = trim(key);
+  if (!s.empty() && s.front() == '(' && s.back() == ')') {
+    s = s.substr(1, s.size()-2);
+  }
+  auto comma = s.find(',');
+  if (comma == std::string::npos) return false;
+  std::string a = trim(s.substr(0, comma));
+  std::string b_str = trim(s.substr(comma+1));
+  try {
+    if (bit)   *bit   = static_cast<uint32_t>(std::stoul(a));
+    if (depth) *depth = std::stoi(b_str);
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
+// Canonical formatter. Matches stored key format: "(bit, depth)"
+static inline std::string fmt_key(uint32_t bit, int depth) {
+  return "(" + std::to_string(bit) + ", " + std::to_string(depth) + ")";
+}
+
+// Parent: (bit, d) → (bit, d-1). Returns empty string if d==0 or parse fails.
+static inline std::string parent_key(const std::string& k) {
+  uint32_t bit = 0; int d = 0;
+  if (!parse_bitdepth(k, &bit, &d)) return "";
+  if (d <= 0) return "";
+  return fmt_key(bit, d-1);
+}
+
+// Evaluate closeness by walking up to 'proximity_gap' parents, bounded by min_parent_depth.
+static inline bool is_close_1d(
+    const std::string& key,
+    const std::unordered_set<std::string>& train_1d,
+    const NCMConfig& cfg)
+{
+  if (train_1d.find(key) != train_1d.end()) return true;
+  uint32_t bit = 0; int d = 0;
+  if (!parse_bitdepth(key, &bit, &d)) return false;
+  int hops = 0;
+  int curd = d;
+  while (hops < cfg.dmax) {
+    if (curd <= cfg.min_parent_depth) break;
+    --curd; ++hops;
+    auto anc = fmt_key(bit, curd);
+    if (train_1d.find(anc) != train_1d.end()) return true;
+  }
+  return false;
+}
+
+// Backoff single 1D key to nearest train ancestor (including itself). Returns empty string if none.
+static inline std::string backoff_1d(
+    const std::string& key,
+    const std::unordered_set<std::string>& train_1d,
+    const NCMConfig& cfg)
+{
+  if (train_1d.find(key) != train_1d.end()) return key;
+  uint32_t bit = 0; int d = 0;
+  if (!parse_bitdepth(key, &bit, &d)) return "";
+  int hops = 0;
+  int curd = d;
+  while (hops < cfg.dmax) {
+    if (curd <= cfg.min_parent_depth) break;
+    --curd; ++hops;
+    auto anc = fmt_key(bit, curd);
+    if (train_1d.find(anc) != train_1d.end()) return anc;
+  }
+  return "";
+}
+
+// Split composite key "k1|k2" (or 3D "k1|k2|k3")
+static inline std::vector<std::string> split_components(const std::string& key) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (true) {
+    size_t pos = key.find(kCompositeSep, start);
+    if (pos == std::string::npos) {
+      out.emplace_back(key.substr(start));
+      break;
+    }
+    out.emplace_back(key.substr(start, pos - start));
+    start = pos + 1;  // kCompositeSep is "|" (1 char)
+  }
+  return out;
+}
+
+static inline std::string join_components(const std::vector<std::string>& comps) {
+  std::string s;
+  for (size_t i=0;i<comps.size();++i) {
+    if (i) s += kCompositeSep;
+    s += comps[i];
+  }
+  return s;
+}
+
+static inline bool is_close_composite(
+    const std::string& key,
+    const std::unordered_set<std::string>& train_1d,
+    const NCMConfig& cfg)
+{
+  auto comps = split_components(key);
+  int close_cnt = 0;
+  for (const auto& c : comps) {
+    bool cclose = is_close_1d(c, train_1d, cfg);
+    if (cfg.require_all_components && !cclose) return false;
+    if (cclose) ++close_cnt;
+  }
+  return cfg.require_all_components ? true : (close_cnt > 0);
+}
+
+// Helper: Compute distance to nearest train presence (for distance decay)
+static inline int min_dist_to_train_presence_1d(const std::string& key1d,
+                                                 const std::unordered_set<std::string>& train_1d_presence,
+                                                 int dmax)
+{
+    // If key is in training, distance is 0
+    if (train_1d_presence.find(key1d) != train_1d_presence.end()) return 0;
+    
+    // Parse (bit, depth)
+    uint32_t bit = 0; int d = 0;
+    if (!parse_bitdepth(key1d, &bit, &d)) return dmax + 1;
+    
+    // Walk up hierarchy to find nearest train ancestor
+    for (int hops = 1; hops <= dmax; ++hops) {
+        int curd = d - hops;
+        if (curd < 0) break;
+        auto anc = fmt_key(bit, curd);
+        if (train_1d_presence.find(anc) != train_1d_presence.end()) {
+            return hops;
+        }
+    }
+    return dmax + 1; // not found within dmax
+}
+
+static inline std::string backoff_composite(
+    const std::string& key,
+    const std::unordered_set<std::string>& train_1d,
+    const NCMConfig& cfg)
+{
+  auto comps = split_components(key);
+  std::vector<std::string> rebuilt; rebuilt.reserve(comps.size());
+  for (const auto& c : comps) {
+    auto r = backoff_1d(c, train_1d, cfg);
+    if (r.empty()) return ""; // fail if any comp cannot back off within dmax
+    rebuilt.emplace_back(r);
+  }
+  return join_components(rebuilt);
+}
+} // namespace ncm
+
+// Helper: Compute distance to nearest train presence (wrapper for ncm namespace)
+inline int ncm_min_dist_to_train_presence_1d(const std::string& key1d,
+                                             const std::unordered_set<std::string>& train_1d_presence,
+                                             int dmax)
+{
+    return ncm::min_dist_to_train_presence_1d(key1d, train_1d_presence, dmax);
+}
+
+// Distance helpers (adapted for string keys with (bit,depth) format).
+static inline int ncm_dist1d(const string& k1, const NCMContext& ctx) {
+  const auto& cfg = *ctx.cfg;
+  const auto& tp  = *ctx.tp;
+  if (cfg.mode == ProximityMode::NONE) return 0;
+  if (tp.seen1d.count(k1) && tp.seen1d.at(k1)) return 0;
+  
+  // Try parent climbing: (bit,depth) -> (bit,depth-1) -> ... -> (bit,0)
+  if (cfg.dmax <= 0) return INT_MAX;
+  
+  string cur = k1;
+  int d = 1;
+  while (d <= cfg.dmax) {
+    string parent = ncm::parent_key(cur);
+    if (parent.empty()) break;  // Cannot generate parent (depth <= 0)
+    
+    if (tp.seen1d.count(parent) && tp.seen1d.at(parent)) {
+      return d;  // Found parent at distance d
+    }
+    
+    cur = parent;
+    ++d;
+  }
+  
+  return INT_MAX;  // Not close enough
+}
+
+static inline int ncm_dist2d(const string& a1d, const string& b1d, const string& k2,
+                             const NCMContext& ctx) {
+  const auto& cfg = *ctx.cfg;
+  const auto& tp  = *ctx.tp;
+  if (cfg.mode == ProximityMode::NONE) return 0;
+  if (tp.seen2d.count(k2) && tp.seen2d.at(k2)) return 0;
+  const bool a0 = tp.seen1d.count(a1d) && tp.seen1d.at(a1d);
+  const bool b0 = tp.seen1d.count(b1d) && tp.seen1d.at(b1d);
+  if (a0 && b0) return 1;  // exact pair unseen, both components seen
+  if (cfg.dmax <= 1) return INT_MAX;
+  int da = a0 ? 0 : ncm_dist1d(a1d, ctx);
+  int db = b0 ? 0 : ncm_dist1d(b1d, ctx);
+  if (da == INT_MAX || db == INT_MAX) return INT_MAX;
+  return 1 + std::max(da, db);
+}
+
+static inline int ncm_dist3d(const string& a1d, const string& b1d, const string& c1d, const string& k3,
+                             const NCMContext& ctx) {
+  const auto& cfg = *ctx.cfg;
+  const auto& tp  = *ctx.tp;
+  if (cfg.mode == ProximityMode::NONE) return 0;
+  if (tp.seen3d.count(k3) && tp.seen3d.at(k3)) return 0;
+  const bool a0 = tp.seen1d.count(a1d) && tp.seen1d.at(a1d);
+  const bool b0 = tp.seen1d.count(b1d) && tp.seen1d.at(b1d);
+  const bool c0 = tp.seen1d.count(c1d) && tp.seen1d.at(c1d);
+  if (a0 && b0 && c0) return 1; // exact triple unseen, components seen
+  if (cfg.dmax <= 1) return INT_MAX;
+  int da = a0 ? 0 : ncm_dist1d(a1d, ctx);
+  int db = b0 ? 0 : ncm_dist1d(b1d, ctx);
+  int dc = c0 ? 0 : ncm_dist1d(c1d, ctx);
+  if (da == INT_MAX || db == INT_MAX || dc == INT_MAX) return INT_MAX;
+  return 1 + std::max(da, std::max(db, dc));
+}
+
+// Backoff helpers: use 1D parent prevalence with decay.
+static inline double ncm_backoff_1d(const string& nearest_parent_1d_key,
+                                    double parent_prev,
+                                    int d, const NCMConfig& cfg) {
+  if (d <= 0) return parent_prev;
+  return std::pow(cfg.lambda, d) * parent_prev;
+}
+
+// Policy (mask/backoff) for 1D
+static inline double ncm_apply_1d(const string& k1, double p_self,
+                                  // optional: nearest parent key + parent prevalence if you have them
+                                  int dist, const NCMContext& ctx,
+                                  double parent_prev = 0.0) {
+  if (ctx.cfg->mode == ProximityMode::NONE || dist == 0) return p_self;
+  if (dist == INT_MAX || dist > ctx.cfg->dmax) return 0.0;
+  if (ctx.cfg->mode == ProximityMode::HIER_MASK) return p_self; // keep if within dmax
+  // backoff
+  return ncm_backoff_1d("", parent_prev > 0.0 ? parent_prev : p_self, dist, *ctx.cfg);
+}
+
+// Simple g() combiners for 2D/3D backoff (mean by default).
+static inline double g2(double a, double b) { return 0.5 * (a + b); }
+static inline double g3(double a, double b, double c) { return (a + b + c) / 3.0; }
+
+// ================================================================
+// MOLFTP NCM FASTPATH: helpers for zero-allocation key operations
+// ================================================================
+
+// Encode 1D key as uint64_t: (bit << 8) | depth
+static inline uint64_t encode_1d_key(uint32_t bit, uint8_t depth) noexcept {
+  return (static_cast<uint64_t>(bit) << 8) | static_cast<uint64_t>(depth);
+}
+
+static inline uint8_t depth_of(uint64_t id) noexcept { 
+  return static_cast<uint8_t>(id & 0xFFull); 
+}
+
+static inline uint64_t parent_of(uint64_t id) noexcept {
+  uint8_t d = depth_of(id);
+  if (d == 0) return UINT64_MAX;
+  return (id & ~0xFFull) | static_cast<uint64_t>(d - 1);
+}
+
+// Parse "(123,2)" without allocations/stoi - fast path
+static inline bool parse_bitdepth_fast(const std::string& s, uint32_t& bit, uint8_t& depth) noexcept {
+  const char* p = s.data();
+  const char* e = p + s.size();
+  if (p == e) return false;
+  if (*p == '(') ++p;  // skip '(' if present
+  // parse bit
+  uint64_t b = 0;
+  bool any = false;
+  while (p < e && *p >= '0' && *p <= '9') { 
+    b = b*10 + static_cast<uint64_t>(*p - '0'); 
+    ++p; 
+    any = true; 
+  }
+  if (!any) return false;
+  // skip delimiter: ',' or '|' and optional space
+  if (p >= e) return false;
+  if (*p != ',' && *p != '|') return false;
+  ++p;
+  while (p < e && (*p==' ')) ++p;
+  // parse depth
+  uint64_t d = 0; 
+  any = false;
+  while (p < e && *p >= '0' && *p <= '9') { 
+    d = d*10 + static_cast<uint64_t>(*p - '0'); 
+    ++p; 
+    any = true; 
+  }
+  if (!any) return false;
+  bit = static_cast<uint32_t>(b);
+  depth = static_cast<uint8_t>(d);
+  return true;
+}
+
+// Extract first component 1D id from composite key without allocating substrings
+static inline uint64_t first_component_1d_id(const std::string& composite) noexcept {
+  const char* p = composite.data();
+  const char* e = p + composite.size();
+  // find '|' once
+  const char* bar = p;
+  while (bar < e && *bar != '|') ++bar;
+  if (bar == e) { // no '|', fallback to parse as 1D
+    uint32_t b=0; uint8_t d=0;
+    if (!parse_bitdepth_fast(composite, b, d)) return UINT64_MAX;
+    return encode_1d_key(b, d);
+  }
+  // parse prefix [p,bar) - one allocation per unique composite (cached below)
+  uint32_t b=0; uint8_t d=0;
+  std::string tmp; tmp.assign(p, bar - p);
+  if (!parse_bitdepth_fast(tmp, b, d)) return UINT64_MAX;
+  return encode_1d_key(b, d);
+}
+
+// ================================================================
+// MOLFTP NCM FASTPATH: cache structure
+// ================================================================
+struct NCMCache {
+  bool enabled = false;
+  uint8_t dmax = 0;
+  bool backoff = false;  // false = hier-mask, true = hier-backoff
+  bool amp = false;      // amplitude on/off
+  
+  // 1D universe: map encoded id -> dense index
+  std::unordered_map<uint64_t, int> id2idx1d;  // encoded 1D id -> dense index
+  std::unordered_map<std::string, int> key2idx1d;  // string key -> dense index (for lookups)
+  std::vector<int> parent_idx1d;               // parent index or -1
+  std::vector<uint8_t> present1d_by_idx;       // presence bitmap for train
+  std::vector<float> amp1d_by_idx;             // train-share amplitude (or 1.0)
+  
+  // 2D/3D amplitude projection (key->index mapping)
+  std::unordered_map<std::string, float> amp2d_by_key;
+  std::unordered_map<std::string, float> amp3d_by_key;
+  
+  // token guarding rebuilds
+  size_t build_token = 0;
+  
+  // Per-row 1D key IDs (built during fit or first transform)
+  std::vector<std::vector<uint64_t>> row_to_1d_ids_;
+};
+
+// ================================================================
+// NCM Amplitude helpers (continue in ncm namespace)
+// ================================================================
+// Note: namespace ncm is already open from above
+
+// During fit(): populate counts.train_1d once from training rows.
+static void ncm_build_train_counts_1d(const std::vector<std::vector<std::string>>& train_row_1d_keys,
+                                      NCMContext& ncm)
+{
+    auto& M = ncm.counts.train_1d;
+    M.clear();
+    size_t reserve_hint = 0;
+    for (const auto& ks : train_row_1d_keys) reserve_hint += ks.size();
+    M.reserve((reserve_hint / 2) + 1024);
+    for (const auto& ks : train_row_1d_keys) {
+        for (const auto& k : ks) ++M[k];
+    }
+}
+
+// At transform(): build counts.target_1d once per batch (the dataset you pass to transform()).
+static void ncm_build_target_counts_1d(const std::vector<std::vector<std::string>>& batch_row_1d_keys,
+                                       NCMContext& ncm,
+                                       const std::vector<bool>* train_row_mask /*nullable*/)
+{
+    auto& M = ncm.counts.target_1d;
+    M.clear();
+    size_t reserve_hint = 0;
+    for (const auto& ks : batch_row_1d_keys) reserve_hint += ks.size();
+    M.reserve((reserve_hint / 2) + 1024);
+
+    // We count all rows in the current batch. If you prefer "test‑only",
+    // skip rows where train_row_mask[i]==true.
+    const bool have_mask = (train_row_mask && !train_row_mask->empty());
+    for (size_t i = 0; i < batch_row_1d_keys.size(); ++i) {
+        if (have_mask && (*train_row_mask)[i]) continue; // test‑only stats
+        for (const auto& k : batch_row_1d_keys[i]) ++M[k];
+    }
+}
+
+// Where you finalize the feature value for a 1D/2D/3D key (after NCM mask/backoff),
+// multiply by amplitude (if enabled). Example for a 1D key path:
+inline double ncm_finalize_value_1d(const std::string& key_1d,
+                                   double v_after_ncm,
+                                   const NCMContext& ncm,
+                                   bool is_train_row,
+                                   const std::unordered_set<std::string>* train_1d_presence = nullptr)
+{
+    if (!ncm.amp.apply_to_train_rows && is_train_row) return v_after_ncm;
+    const float amp = ncm_amplitude_for_key(key_1d, ncm.counts, ncm.amp, 
+                                           train_1d_presence, 
+                                           ncm.cfg ? ncm.cfg->dmax : 0);
+    return v_after_ncm * static_cast<double>(amp);
+}
+
+// Helper: Extract components from composite key
+inline std::vector<std::string> ncm_get_components(const std::string& key) {
+    return ncm::split_components(key);
+}
+
+// Finalize value for 2D/3D keys (uses MIN amplitude across components - more conservative)
+inline double ncm_finalize_value_2d3d(const std::string& key_composite,
+                                     double v_after_ncm,
+                                     const NCMContext& ncm,
+                                     bool is_train_row,
+                                     const std::unordered_set<std::string>* train_1d_presence = nullptr)
+{
+    if (!ncm.amp.apply_to_train_rows && is_train_row) return v_after_ncm;
+    
+    // Extract components
+    auto comps = ncm_get_components(key_composite);
+    if (comps.empty()) return v_after_ncm;
+    
+    int dmax = ncm.cfg ? ncm.cfg->dmax : 0;
+    
+    // Option 1: Use first component only (backward compatible, faster)
+    if (ncm.amp.first_component_only && !comps.empty()) {
+        float amp = ncm_amplitude_for_key(comps[0], ncm.counts, ncm.amp, 
+                                         train_1d_presence, dmax);
+        return v_after_ncm * static_cast<double>(amp);
+    }
+    
+    // Option 2: Use MIN over all components (more conservative, recommended)
+    float min_amp = 1.0f;
+    bool first = true;
+    for (const auto& comp : comps) {
+        float amp = ncm_amplitude_for_key(comp, ncm.counts, ncm.amp, 
+                                         train_1d_presence, dmax);
+        if (first) {
+            min_amp = amp;
+            first = false;
+        } else if (amp < min_amp) {
+            min_amp = amp;
+        }
+    }
+    
+    return v_after_ncm * static_cast<double>(min_amp);
+}
+
+// ================================================================
+// end NCM additions
+// ================================================================
 
 // Counting methods for fragment prevalence statistics
 enum class CountingMethod {
@@ -2554,7 +3188,12 @@ public:
                               const map<string, map<string, double>>& prevalence_data_3d,
                               double atom_gate = 0.0,
                               const string& atom_aggregation = "max",
-                              double softmax_temperature = 1.0) {
+                              double softmax_temperature = 1.0,
+                              const NCMContext* ncm_ctx = nullptr,  // NEW: Optional NCM context
+                              const vector<bool>* train_row_mask = nullptr,  // NEW: Training row mask (size = n_molecules)
+                              const map<string, int>* key_counts = nullptr,  // NEW: Optional key counts for statistical backoff
+                              const StatisticalBackoffConfig* stat_backoff_cfg = nullptr,  // NEW: Statistical backoff config
+                              const map<string, vector<string>>* parents_1d = nullptr) {  // NEW: Optional 1D parent hierarchy
         
         const int n_molecules = smiles.size();
         
@@ -2609,6 +3248,131 @@ public:
         key_buffer.reserve(32);
         
         // NUCLEAR-FAST: Process all molecules with inline vector computation
+        const bool apply_ncm = (ncm_ctx != nullptr && ncm_ctx->cfg != nullptr && 
+                                ncm_ctx->cfg->mode != ProximityMode::NONE);
+        
+        // Build train-presence sets from training rows (only 1D needed; 2D/3D use component-wise checks)
+        std::unordered_set<std::string> train_1d_presence;
+        
+        // Extract 1D keys for ALL molecules (needed for amplitude target counts)
+        std::vector<std::vector<std::string>> batch_row_1d_keys(n_molecules);
+        bool need_amplitude = (ncm_ctx != nullptr && ncm_ctx->amp.source != PROXAMP_OFF);
+        bool need_distance_decay = (need_amplitude && ncm_ctx != nullptr && ncm_ctx->amp.dist_beta > 0.0f);
+        
+        // Build train_1d_presence if needed for NCM (always when NCM is enabled) or distance decay
+        // CRITICAL: train_1d_presence MUST be built when NCM is enabled, regardless of amplitude
+        if (apply_ncm || need_distance_decay) {
+            train_1d_presence.reserve(16384);
+            // Extract 1D keys from all molecules (for amplitude) and build train presence
+            for (int tr = 0; tr < n_molecules; ++tr) {
+                bool is_train = (train_row_mask != nullptr && tr < (int)train_row_mask->size() && (*train_row_mask)[tr]);
+                try {
+                    ROMol* mol = SmilesToMol(smiles[tr]);
+                    if (!mol) continue;
+                    std::vector<boost::uint32_t>* invariants = nullptr;
+                    const std::vector<boost::uint32_t>* fromAtoms = nullptr;
+                    MorganFingerprints::BitInfoMap bitInfo;
+                    auto *siv = MorganFingerprints::getFingerprint(
+                        *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
+                        false, true, true, false, &bitInfo, false);
+                    string key_buf;
+                    key_buf.reserve(32);
+                    for (const auto& kv : bitInfo) {
+                        unsigned int bit = kv.first;
+                        const auto& hits = kv.second;
+                        if (!hits.empty()) {
+                            unsigned int depth = hits[0].second;
+                            key_buf.clear();
+                            key_buf = "(";
+                            key_buf += to_string(bit);
+                            key_buf += ", ";
+                            key_buf += to_string(depth);
+                            key_buf += ")";
+                            
+                            // Store for amplitude
+                            if (need_amplitude) {
+                                batch_row_1d_keys[tr].push_back(key_buf);
+                            }
+                            
+                            // Build train presence (needed for NCM or distance decay)
+                            // CRITICAL: Always build when NCM is enabled, regardless of amplitude
+                            if (is_train && apply_ncm) {
+                                train_1d_presence.insert(key_buf);
+                            } else if (is_train && need_distance_decay) {
+                                // Also build for distance decay even if NCM is off
+                                train_1d_presence.insert(key_buf);
+                            }
+                        }
+                    }
+                    if (siv) delete siv;
+                    delete mol;
+                } catch (...) {
+                    continue;
+                }
+            }
+        } else if (need_amplitude) {
+            // Only need amplitude counts, not train presence
+            for (int tr = 0; tr < n_molecules; ++tr) {
+                try {
+                    ROMol* mol = SmilesToMol(smiles[tr]);
+                    if (!mol) continue;
+                    std::vector<boost::uint32_t>* invariants = nullptr;
+                    const std::vector<boost::uint32_t>* fromAtoms = nullptr;
+                    MorganFingerprints::BitInfoMap bitInfo;
+                    auto *siv = MorganFingerprints::getFingerprint(
+                        *mol, static_cast<unsigned int>(radius), invariants, fromAtoms,
+                        false, true, true, false, &bitInfo, false);
+                    string key_buf;
+                    key_buf.reserve(32);
+                    for (const auto& kv : bitInfo) {
+                        unsigned int bit = kv.first;
+                        const auto& hits = kv.second;
+                        if (!hits.empty()) {
+                            unsigned int depth = hits[0].second;
+                            key_buf.clear();
+                            key_buf = "(";
+                            key_buf += to_string(bit);
+                            key_buf += ", ";
+                            key_buf += to_string(depth);
+                            key_buf += ")";
+                            batch_row_1d_keys[tr].push_back(key_buf);
+                        }
+                    }
+                    if (siv) delete siv;
+                    delete mol;
+                } catch (...) {
+                    continue;
+                }
+            }
+        }
+        
+        // Build amplitude counts if needed
+        if (need_amplitude && ncm_ctx != nullptr) {
+            // Build train counts from train rows
+            std::vector<std::vector<std::string>> train_row_1d_keys;
+            if (train_row_mask != nullptr) {
+                for (int tr = 0; tr < n_molecules && tr < (int)train_row_mask->size(); ++tr) {
+                    if ((*train_row_mask)[tr]) {
+                        train_row_1d_keys.push_back(batch_row_1d_keys[tr]);
+                    }
+                }
+            }
+            ncm_build_train_counts_1d(train_row_1d_keys, *const_cast<NCMContext*>(ncm_ctx));
+            
+            // Build target counts from batch (excluding train rows if needed)
+            ncm_build_target_counts_1d(batch_row_1d_keys, *const_cast<NCMContext*>(ncm_ctx), train_row_mask);
+        }
+        
+        // Create NCM config from context
+        NCMConfig ncm_cfg;
+        if (apply_ncm && ncm_ctx != nullptr && ncm_ctx->cfg != nullptr) {
+            ncm_cfg = *ncm_ctx->cfg;
+        }
+        
+        // CRITICAL SAFETY CHECK: If NCM is enabled but train_1d_presence is empty,
+        // we cannot apply NCM correctly (would zero all features). Skip NCM in this case.
+        bool can_apply_ncm = apply_ncm && !train_1d_presence.empty();
+        
         for (int i = 0; i < n_molecules; ++i) {
             try {
                 ROMol* mol = SmilesToMol(smiles[i]);
@@ -2663,6 +3427,96 @@ public:
                             auto itP = pass_map_1d->find(key_buffer);
                             if (itP != pass_map_1d->end()) {
                                 double w = itP->second;
+                                
+                                // [STATISTICAL BACKOFF HOOK - 1D]
+                                // Apply statistical backoff: use parent if key count < threshold
+                                if (stat_backoff_cfg != nullptr && 
+                                    stat_backoff_cfg->mode == StatisticalBackoffMode::COUNT_THRESHOLD &&
+                                    key_counts != nullptr) {
+                                    auto it_count = key_counts->find(key_buffer);
+                                    int key_count = (it_count != key_counts->end()) ? it_count->second : 0;
+                                    
+                                    if (key_count < stat_backoff_cfg->threshold) {
+                                        // Key is rare - apply hierarchical backoff
+                                        string current_key = key_buffer;
+                                        int distance = 0;
+                                        bool found_suitable = false;
+                                        
+                                        while (distance < stat_backoff_cfg->dmax && !found_suitable) {
+                                            // Get parent key
+                                            string parent_key = "";
+                                            if (parents_1d != nullptr && !parents_1d->empty()) {
+                                                auto it_parents = parents_1d->find(current_key);
+                                                if (it_parents != parents_1d->end() && !it_parents->second.empty()) {
+                                                    parent_key = it_parents->second[0]; // Use first parent
+                                                }
+                                            }
+                                            
+                                            if (parent_key.empty()) {
+                                                // Try to generate parent by decreasing depth
+                                                uint32_t bit = 0; int depth = 0;
+                                                if (ncm::parse_bitdepth(current_key, &bit, &depth) && depth > 0) {
+                                                    parent_key = ncm::fmt_key(bit, depth - 1);
+                                                }
+                                            }
+                                            
+                                            if (parent_key.empty()) break;
+                                            
+                                            // Check parent count
+                                            auto it_parent_count = key_counts->find(parent_key);
+                                            int parent_count = (it_parent_count != key_counts->end()) ? it_parent_count->second : 0;
+                                            
+                                            if (parent_count >= stat_backoff_cfg->threshold) {
+                                                // Parent has sufficient support - use parent with decay
+                                                auto it_parent_prev = pass_map_1d->find(parent_key);
+                                                if (it_parent_prev != pass_map_1d->end()) {
+                                                    w = it_parent_prev->second * std::pow(stat_backoff_cfg->lambda, distance + 1);
+                                                    found_suitable = true;
+                                                }
+                                                break;
+                                            }
+                                            
+                                            // Parent is also rare - continue climbing
+                                            current_key = parent_key;
+                                            distance++;
+                                        }
+                                        
+                                        if (!found_suitable) {
+                                            // No suitable parent found - zero out (fallback to dummy masking)
+                                            w = 0.0;
+                                        }
+                                    }
+                                    // else: key_count >= threshold, use own prevalence (w already set)
+                                }
+                                
+                                // [NCM HOOK - 1D]
+                                if (can_apply_ncm) {
+                                    if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                        // Mask mode: keep if close, else zero
+                                        if (!ncm::is_close_1d(key_buffer, train_1d_presence, ncm_cfg)) {
+                                            w = 0.0;
+                                        }
+                                    } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                        // Backoff mode: replace by nearest ancestor
+                                        auto rk = ncm::backoff_1d(key_buffer, train_1d_presence, ncm_cfg);
+                                        if (!rk.empty()) {
+                                            auto it_backoff = pass_map_1d->find(rk);
+                                            if (it_backoff != pass_map_1d->end()) {
+                                                w = it_backoff->second;
+                                            } else {
+                                                w = 0.0;  // Backoff key not in prevalence
+                                            }
+                                        } else {
+                                            w = 0.0;  // No ancestor found
+                                        }
+                                    }
+                                }
+                                // Apply amplitude finalization if enabled
+                                if (need_amplitude && ncm_ctx != nullptr) {
+                                    bool is_train_row = (train_row_mask != nullptr && i < (int)train_row_mask->size() && (*train_row_mask)[i]);
+                                    const std::unordered_set<std::string>* train_1d_ptr = (apply_ncm || need_distance_decay) ? &train_1d_presence : nullptr;
+                                    w = ncm_finalize_value_1d(key_buffer, w, *ncm_ctx, is_train_row, train_1d_ptr);
+                                }
                                 prevalence_1d[atomIdx] = std::max(prevalence_1d[atomIdx], w);
                                 prevalencer_1d[atomIdx][depth] = std::max(prevalencer_1d[atomIdx][depth], w);
                             }
@@ -2671,16 +3525,159 @@ public:
                             auto itF = fail_map_1d->find(key_buffer);
                             if (itF != fail_map_1d->end()) {
                                 double wneg = -itF->second;
+                                
+                                // [STATISTICAL BACKOFF HOOK - 1D FAIL]
+                                // Apply statistical backoff: use parent if key count < threshold
+                                if (stat_backoff_cfg != nullptr && 
+                                    stat_backoff_cfg->mode == StatisticalBackoffMode::COUNT_THRESHOLD &&
+                                    key_counts != nullptr) {
+                                    auto it_count = key_counts->find(key_buffer);
+                                    int key_count = (it_count != key_counts->end()) ? it_count->second : 0;
+                                    
+                                    if (key_count < stat_backoff_cfg->threshold) {
+                                        // Key is rare - apply hierarchical backoff
+                                        string current_key = key_buffer;
+                                        int distance = 0;
+                                        bool found_suitable = false;
+                                        
+                                        while (distance < stat_backoff_cfg->dmax && !found_suitable) {
+                                            // Get parent key
+                                            string parent_key = "";
+                                            if (parents_1d != nullptr && !parents_1d->empty()) {
+                                                auto it_parents = parents_1d->find(current_key);
+                                                if (it_parents != parents_1d->end() && !it_parents->second.empty()) {
+                                                    parent_key = it_parents->second[0]; // Use first parent
+                                                }
+                                            }
+                                            
+                                            if (parent_key.empty()) {
+                                                // Try to generate parent by decreasing depth
+                                                uint32_t bit = 0; int depth = 0;
+                                                if (ncm::parse_bitdepth(current_key, &bit, &depth) && depth > 0) {
+                                                    parent_key = ncm::fmt_key(bit, depth - 1);
+                                                }
+                                            }
+                                            
+                                            if (parent_key.empty()) break;
+                                            
+                                            // Check parent count
+                                            auto it_parent_count = key_counts->find(parent_key);
+                                            int parent_count = (it_parent_count != key_counts->end()) ? it_parent_count->second : 0;
+                                            
+                                            if (parent_count >= stat_backoff_cfg->threshold) {
+                                                // Parent has sufficient support - use parent with decay
+                                                auto it_parent_prev = fail_map_1d->find(parent_key);
+                                                if (it_parent_prev != fail_map_1d->end()) {
+                                                    wneg = -it_parent_prev->second * std::pow(stat_backoff_cfg->lambda, distance + 1);
+                                                    found_suitable = true;
+                                                }
+                                                break;
+                                            }
+                                            
+                                            // Parent is also rare - continue climbing
+                                            current_key = parent_key;
+                                            distance++;
+                                        }
+                                        
+                                        if (!found_suitable) {
+                                            // No suitable parent found - zero out (fallback to dummy masking)
+                                            wneg = 0.0;
+                                        }
+                                    }
+                                    // else: key_count >= threshold, use own prevalence (wneg already set)
+                                }
+                                
+                                // [NCM HOOK - 1D FAIL]
+                                if (can_apply_ncm) {
+                                    if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                        // Mask mode: keep if close, else zero
+                                        if (!ncm::is_close_1d(key_buffer, train_1d_presence, ncm_cfg)) {
+                                            wneg = 0.0;
+                                        }
+                                    } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                        // Backoff mode: replace by nearest ancestor
+                                        auto rk = ncm::backoff_1d(key_buffer, train_1d_presence, ncm_cfg);
+                                        if (!rk.empty()) {
+                                            auto it_backoff = fail_map_1d->find(rk);
+                                            if (it_backoff != fail_map_1d->end()) {
+                                                wneg = -it_backoff->second;
+                                            } else {
+                                                wneg = 0.0;  // Backoff key not in prevalence
+                                            }
+                                        } else {
+                                            wneg = 0.0;  // No ancestor found
+                                        }
+                                    }
+                                }
+                                // Apply amplitude finalization if enabled (for negative values, apply to absolute value then restore sign)
+                                if (need_amplitude && ncm_ctx != nullptr) {
+                                    bool is_train_row = (train_row_mask != nullptr && i < (int)train_row_mask->size() && (*train_row_mask)[i]);
+                                    double wneg_abs = std::abs(wneg);
+                                    double wneg_signed = wneg < 0.0 ? -1.0 : 1.0;
+                                    const std::unordered_set<std::string>* train_1d_ptr = (apply_ncm || need_distance_decay) ? &train_1d_presence : nullptr;
+                                    wneg = wneg_signed * ncm_finalize_value_1d(key_buffer, wneg_abs, *ncm_ctx, is_train_row, train_1d_ptr);
+                                }
                                 prevalence_1d[atomIdx] = std::min(prevalence_1d[atomIdx], wneg);
                                 prevalencer_1d[atomIdx][depth] = std::min(prevalencer_1d[atomIdx][depth], wneg);
                             }
                         }
                         
                         // 2D prevalence
+                        // Note: 2D prevalence maps store 1D keys, but we check component-wise if key is composite
                         if (pass_map_2d) {
                             auto itP = pass_map_2d->find(key_buffer);
                             if (itP != pass_map_2d->end()) {
                                 double w = itP->second;
+                                // [NCM HOOK - 2D]
+                                if (can_apply_ncm) {
+                                    // Check if key_buffer is composite (has "|") or single 1D key
+                                    bool is_composite = (key_buffer.find(ncm::kCompositeSep) != std::string::npos);
+                                    if (is_composite) {
+                                        // Component-wise check for composite keys
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_composite(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                w = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_composite(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = pass_map_2d->find(rk);
+                                                if (it_backoff != pass_map_2d->end()) {
+                                                    w = it_backoff->second;
+                                                } else {
+                                                    w = 0.0;
+                                                }
+                                            } else {
+                                                w = 0.0;
+                                            }
+                                        }
+                                    } else {
+                                        // Single 1D key: use 1D logic
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_1d(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                w = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_1d(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = pass_map_2d->find(rk);
+                                                if (it_backoff != pass_map_2d->end()) {
+                                                    w = it_backoff->second;
+                                                } else {
+                                                    w = 0.0;
+                                                }
+                                            } else {
+                                                w = 0.0;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Apply amplitude finalization if enabled (for 2D)
+                                if (need_amplitude && ncm_ctx != nullptr) {
+                                    bool is_train_row = (train_row_mask != nullptr && i < (int)train_row_mask->size() && (*train_row_mask)[i]);
+                                    const std::unordered_set<std::string>* train_1d_ptr = (apply_ncm || need_distance_decay) ? &train_1d_presence : nullptr;
+                                    w = ncm_finalize_value_2d3d(key_buffer, w, *ncm_ctx, is_train_row, train_1d_ptr);
+                                }
                                 prevalence_2d[atomIdx] = std::max(prevalence_2d[atomIdx], w);
                                 prevalencer_2d[atomIdx][depth] = std::max(prevalencer_2d[atomIdx][depth], w);
                             }
@@ -2689,16 +3686,115 @@ public:
                             auto itF = fail_map_2d->find(key_buffer);
                             if (itF != fail_map_2d->end()) {
                                 double wneg = -itF->second;
+                                // [NCM HOOK - 2D FAIL]
+                                if (can_apply_ncm) {
+                                    bool is_composite = (key_buffer.find(ncm::kCompositeSep) != std::string::npos);
+                                    if (is_composite) {
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_composite(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                wneg = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_composite(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = fail_map_2d->find(rk);
+                                                if (it_backoff != fail_map_2d->end()) {
+                                                    wneg = -it_backoff->second;
+                                                } else {
+                                                    wneg = 0.0;
+                                                }
+                                            } else {
+                                                wneg = 0.0;
+                                            }
+                                        }
+                                    } else {
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_1d(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                wneg = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_1d(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = fail_map_2d->find(rk);
+                                                if (it_backoff != fail_map_2d->end()) {
+                                                    wneg = -it_backoff->second;
+                                                } else {
+                                                    wneg = 0.0;
+                                                }
+                                            } else {
+                                                wneg = 0.0;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Apply amplitude finalization if enabled (for negative 2D values)
+                                if (need_amplitude && ncm_ctx != nullptr) {
+                                    bool is_train_row = (train_row_mask != nullptr && i < (int)train_row_mask->size() && (*train_row_mask)[i]);
+                                    double wneg_abs = std::abs(wneg);
+                                    double wneg_signed = wneg < 0.0 ? -1.0 : 1.0;
+                                    const std::unordered_set<std::string>* train_1d_ptr = (apply_ncm || need_distance_decay) ? &train_1d_presence : nullptr;
+                                    wneg = wneg_signed * ncm_finalize_value_2d3d(key_buffer, wneg_abs, *ncm_ctx, is_train_row, train_1d_ptr);
+                                }
                                 prevalence_2d[atomIdx] = std::min(prevalence_2d[atomIdx], wneg);
                                 prevalencer_2d[atomIdx][depth] = std::min(prevalencer_2d[atomIdx][depth], wneg);
                             }
                         }
                         
                         // 3D prevalence
+                        // Note: 3D prevalence maps store 1D keys, but we check component-wise if key is composite
                         if (pass_map_3d) {
                             auto itP = pass_map_3d->find(key_buffer);
                             if (itP != pass_map_3d->end()) {
                                 double w = itP->second;
+                                // [NCM HOOK - 3D]
+                                if (can_apply_ncm) {
+                                    bool is_composite = (key_buffer.find(ncm::kCompositeSep) != std::string::npos);
+                                    if (is_composite) {
+                                        // Component-wise check for composite keys
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_composite(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                w = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_composite(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = pass_map_3d->find(rk);
+                                                if (it_backoff != pass_map_3d->end()) {
+                                                    w = it_backoff->second;
+                                                } else {
+                                                    w = 0.0;
+                                                }
+                                            } else {
+                                                w = 0.0;
+                                            }
+                                        }
+                                    } else {
+                                        // Single 1D key: use 1D logic
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_1d(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                w = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_1d(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = pass_map_3d->find(rk);
+                                                if (it_backoff != pass_map_3d->end()) {
+                                                    w = it_backoff->second;
+                                                } else {
+                                                    w = 0.0;
+                                                }
+                                            } else {
+                                                w = 0.0;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Apply amplitude finalization if enabled (for 3D)
+                                if (need_amplitude && ncm_ctx != nullptr) {
+                                    bool is_train_row = (train_row_mask != nullptr && i < (int)train_row_mask->size() && (*train_row_mask)[i]);
+                                    const std::unordered_set<std::string>* train_1d_ptr = (apply_ncm || need_distance_decay) ? &train_1d_presence : nullptr;
+                                    w = ncm_finalize_value_2d3d(key_buffer, w, *ncm_ctx, is_train_row, train_1d_ptr);
+                                }
                                 prevalence_3d[atomIdx] = std::max(prevalence_3d[atomIdx], w);
                                 prevalencer_3d[atomIdx][depth] = std::max(prevalencer_3d[atomIdx][depth], w);
                             }
@@ -2707,6 +3803,55 @@ public:
                             auto itF = fail_map_3d->find(key_buffer);
                             if (itF != fail_map_3d->end()) {
                                 double wneg = -itF->second;
+                                // [NCM HOOK - 3D FAIL]
+                                if (can_apply_ncm) {
+                                    bool is_composite = (key_buffer.find(ncm::kCompositeSep) != std::string::npos);
+                                    if (is_composite) {
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_composite(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                wneg = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_composite(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = fail_map_3d->find(rk);
+                                                if (it_backoff != fail_map_3d->end()) {
+                                                    wneg = -it_backoff->second;
+                                                } else {
+                                                    wneg = 0.0;
+                                                }
+                                            } else {
+                                                wneg = 0.0;
+                                            }
+                                        }
+                                    } else {
+                                        if (ncm_cfg.mode == ProximityMode::HIER_MASK) {
+                                            if (!ncm::is_close_1d(key_buffer, train_1d_presence, ncm_cfg)) {
+                                                wneg = 0.0;
+                                            }
+                                        } else if (ncm_cfg.mode == ProximityMode::HIER_BACKOFF) {
+                                            auto rk = ncm::backoff_1d(key_buffer, train_1d_presence, ncm_cfg);
+                                            if (!rk.empty()) {
+                                                auto it_backoff = fail_map_3d->find(rk);
+                                                if (it_backoff != fail_map_3d->end()) {
+                                                    wneg = -it_backoff->second;
+                                                } else {
+                                                    wneg = 0.0;
+                                                }
+                                            } else {
+                                                wneg = 0.0;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Apply amplitude finalization if enabled (for negative 3D values)
+                                if (need_amplitude && ncm_ctx != nullptr) {
+                                    bool is_train_row = (train_row_mask != nullptr && i < (int)train_row_mask->size() && (*train_row_mask)[i]);
+                                    double wneg_abs = std::abs(wneg);
+                                    double wneg_signed = wneg < 0.0 ? -1.0 : 1.0;
+                                    const std::unordered_set<std::string>* train_1d_ptr = (apply_ncm || need_distance_decay) ? &train_1d_presence : nullptr;
+                                    wneg = wneg_signed * ncm_finalize_value_2d3d(key_buffer, wneg_abs, *ncm_ctx, is_train_row, train_1d_ptr);
+                                }
                                 prevalence_3d[atomIdx] = std::min(prevalence_3d[atomIdx], wneg);
                                 prevalencer_3d[atomIdx][depth] = std::min(prevalencer_3d[atomIdx][depth], wneg);
                             }
@@ -2778,9 +3923,14 @@ public:
                         const map<string, map<string, double>>& prevalence_data_3d,
                         double atom_gate = 0.0,
                         const string& atom_aggregation = "max",
-                        double softmax_temperature = 1.0) {
+                        double softmax_temperature = 1.0,
+                        const NCMContext* ncm_ctx = nullptr,
+                        const vector<bool>* train_row_mask = nullptr,
+                        const map<string, int>* key_counts = nullptr,  // NEW: Optional key counts for statistical backoff
+                        const StatisticalBackoffConfig* stat_backoff_cfg = nullptr,  // NEW: Statistical backoff config
+                        const map<string, vector<string>>* parents_1d = nullptr) {  // NEW: Optional 1D parent hierarchy
         // Use the MEGA-FAST batch version
-        return build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature);
+        return build_3view_vectors_batch(smiles, radius, prevalence_data_1d, prevalence_data_2d, prevalence_data_3d, atom_gate, atom_aggregation, softmax_temperature, ncm_ctx, train_row_mask, key_counts, stat_backoff_cfg, parents_1d);                                                     
     }
 
     // LOO-like mode variant (mode: "total" or "influence"). labels are binary 0/1 to compute class totals
@@ -2963,22 +4113,12 @@ public:
             prevalence_data_3d_corrected["FAIL"] = {};
             
             // Process 1D prevalence with correction
-            int debug_count = 0;
             for (const string& key : all_keys_1d) {
                 if (train_keys_1d.find(key) != train_keys_1d.end()) {
                     // Key is present in training split - apply correction factor
                     int N_full = key_counts_1d[key];
                     int N_train = train_key_counts_1d[key];
                     double correction_factor = (N_full > 0) ? (double)N_train / (double)N_full : 1.0;
-                    
-                    // DEBUG: Print first 3 keys
-                    if (debug_count < 3 && prevalence_data_1d_full.at("PASS").count(key)) {
-                        cout << "      DEBUG 1D key " << debug_count << ": N_full=" << N_full 
-                             << " N_train=" << N_train << " factor=" << correction_factor
-                             << " PASS_orig=" << prevalence_data_1d_full.at("PASS").at(key)
-                             << " PASS_corrected=" << (prevalence_data_1d_full.at("PASS").at(key) * correction_factor) << "\n";
-                        debug_count++;
-                    }
                     
                     // Apply correction to both PASS and FAIL
                     if (prevalence_data_1d_full.at("PASS").count(key)) {
@@ -3485,7 +4625,7 @@ public:
     }
     
     // FIXED Key-LOO: Accepts pre-computed key counts to eliminate batch dependency
-    tuple<vector<vector<double>>, vector<vector<double>>, vector<vector<double>>> build_vectors_with_key_loo_fixed(
+    tuple<vector<vector<double>>, vector<vector<double>>, vector<vector<double>>> build_vectors_with_key_loo_fixed(                                                                                                         
         const vector<string>& smiles,
         int radius,
         const map<string, map<string, double>>& prevalence_data_1d_full,
@@ -3501,7 +4641,12 @@ public:
         int k_threshold = 1,
         bool rescale_n_minus_k = false,
         const string& atom_aggregation = "max",
-        double softmax_temperature = 1.0
+        double softmax_temperature = 1.0,
+        const NCMContext* ncm_ctx = nullptr,
+        const vector<bool>* train_row_mask = nullptr,
+        const map<string, int>* key_counts = nullptr,  // NEW: Optional key counts for statistical backoff
+        const StatisticalBackoffConfig* stat_backoff_cfg = nullptr,  // NEW: Statistical backoff config
+        const map<string, vector<string>>* parents_1d = nullptr  // NEW: Optional 1D parent hierarchy
     ) {
         // Create filtered prevalence dictionaries using PRE-COMPUTED counts
         // This ensures vectors are independent of batch size!
@@ -3594,7 +4739,12 @@ public:
             prevalence_data_1d_filtered, prevalence_data_2d_filtered, prevalence_data_3d_filtered,
             0.0,  // atom_gate
             atom_aggregation,
-            softmax_temperature
+            softmax_temperature,
+            ncm_ctx,
+            train_row_mask,
+            key_counts,
+            stat_backoff_cfg,
+            parents_1d
         );
     }
 
@@ -4403,7 +5553,134 @@ private:
     bool use_key_loo_;  // NEW: Enable/disable Key-LOO filtering (true=Key-LOO, false=Dummy-Masking)
     bool verbose_;  // NEW: Enable/disable verbose output
     
+    // --- NCM configuration (exposed to Python) ---
+    NCMConfig ncm_;
+    NCMAmplitudeParams ncm_amp_;  // Amplitude parameters
+    
+    // --- Statistical Backoff configuration ---
+    StatisticalBackoffConfig stat_backoff_;
+    
+    // Optional 1D hierarchy info (safe if left empty).
+    std::map<string, std::vector<string>> parents_1d_;     // string key -> vector of parent keys, may be empty
+    
+    // Cached sizes for quick bitmap allocation
+    size_t K1_ = 0, K2_ = 0, K3_ = 0;
+    
+    // --- NCM FASTPATH: cache for fast index-based lookups ---
+    NCMCache ncm_cache_;      // Shared read-only during transform
+    std::once_flag ncm_once_; // Guard single build per transform() call
+    
     bool is_fitted_;
+    
+    // Computes a build_token that changes if train mask / prevalence universe changes
+    size_t compute_ncm_token(const std::vector<bool>& train_row_mask, int task_idx) const {
+        size_t token = 1469598103934665603ull;
+        token ^= train_row_mask.size(); token *= 1099511628211ull;
+        size_t pop = 0; for (bool v : train_row_mask) pop += (v ? 1 : 0);
+        token ^= pop; token *= 1099511628211ull;
+        if (task_idx >= 0 && task_idx < (int)prevalence_data_1d_per_task_.size()) {
+            const auto& p1d = prevalence_data_1d_per_task_[task_idx];
+            auto itP = p1d.find("PASS");
+            auto itF = p1d.find("FAIL");
+            size_t n1d = 0;
+            if (itP != p1d.end()) n1d += itP->second.size();
+            if (itF != p1d.end()) n1d += itF->second.size();
+            token ^= n1d; token *= 1099511628211ull;
+        }
+        return token;
+    }
+    
+    // Build all NCM caches ONCE per task. Safe to call from transform(); does nothing if current.
+    void ensure_ncm_cache_built(const std::vector<bool>& train_row_mask, int task_idx) {
+        if (ncm_.mode == ProximityMode::NONE && ncm_amp_.source == PROXAMP_OFF) return;
+        
+        const size_t token = compute_ncm_token(train_row_mask, task_idx);
+        if (ncm_cache_.build_token == token && ncm_cache_.enabled) return;
+        
+        // Not built or stale: rebuild
+        ncm_cache_ = NCMCache{}; // reset
+        ncm_cache_.enabled = (ncm_.mode != ProximityMode::NONE);
+        ncm_cache_.dmax = static_cast<uint8_t>(ncm_.dmax);
+        ncm_cache_.backoff = (ncm_.mode == ProximityMode::HIER_BACKOFF);
+        ncm_cache_.amp = (ncm_amp_.source != PROXAMP_OFF);
+        
+        if (task_idx < 0 || task_idx >= (int)prevalence_data_1d_per_task_.size()) return;
+        
+        const auto& prev_1d = prevalence_data_1d_per_task_[task_idx];
+        auto itP = prev_1d.find("PASS");
+        auto itF = prev_1d.find("FAIL");
+        
+        // Collect all 1D keys from prevalence maps
+        std::vector<std::string> all_1d_keys;
+        if (itP != prev_1d.end()) {
+            for (const auto& kv : itP->second) all_1d_keys.push_back(kv.first);
+        }
+        if (itF != prev_1d.end()) {
+            for (const auto& kv : itF->second) {
+                if (itP == prev_1d.end() || itP->second.find(kv.first) == itP->second.end()) {
+                    all_1d_keys.push_back(kv.first);
+                }
+            }
+        }
+        
+        const size_t N1 = all_1d_keys.size();
+        ncm_cache_.id2idx1d.reserve(N1 * 2);
+        ncm_cache_.key2idx1d.reserve(N1 * 2);
+        ncm_cache_.parent_idx1d.assign(N1, -1);
+        ncm_cache_.present1d_by_idx.assign(N1, uint8_t(0));
+        ncm_cache_.amp1d_by_idx.assign(N1, 1.0f);
+        
+        // Build mapping from 1D key string -> idx and encoded id -> idx
+        for (size_t idx = 0; idx < N1; ++idx) {
+            const std::string& k = all_1d_keys[idx];
+            uint32_t b=0; uint8_t d=0;
+            if (!parse_bitdepth_fast(k, b, d)) continue;
+            const uint64_t id = encode_1d_key(b, d);
+            ncm_cache_.id2idx1d.emplace(id, static_cast<int>(idx));
+            ncm_cache_.key2idx1d.emplace(k, static_cast<int>(idx));
+        }
+        
+        // Build parent idx
+        for (size_t idx = 0; idx < N1; ++idx) {
+            const std::string& k = all_1d_keys[idx];
+            uint32_t b=0; uint8_t d=0;
+            if (!parse_bitdepth_fast(k, b, d)) continue;
+            const uint64_t id = encode_1d_key(b, d);
+            const uint64_t pid = parent_of(id);
+            if (pid != UINT64_MAX) {
+                auto it = ncm_cache_.id2idx1d.find(pid);
+                if (it != ncm_cache_.id2idx1d.end()) {
+                    ncm_cache_.parent_idx1d[idx] = it->second;
+                }
+            }
+        }
+        
+        // Build presence bitmap from training molecules (if train_row_mask provided)
+        // Note: We'll build row_to_1d_ids_ on-demand during transform if needed
+        if (!train_row_mask.empty() && ncm_cache_.enabled) {
+            // For now, mark presence based on keys in prevalence maps
+            // This will be refined when we have row_to_1d_ids_ built
+            for (size_t idx = 0; idx < N1; ++idx) {
+                // If key exists in prevalence, assume it was seen in training
+                // (More accurate presence will be built from actual training rows)
+                ncm_cache_.present1d_by_idx[idx] = 1;
+            }
+        }
+        
+        // Build amplitude 1D from train share if available
+        if (ncm_cache_.amp) {
+            // For now, set to 1.0; will be refined with actual counts
+            // Amplitude calculation requires train/target counts which are built per-transform
+            for (size_t idx = 0; idx < N1; ++idx) {
+                ncm_cache_.amp1d_by_idx[idx] = 1.0f;
+            }
+        }
+        
+        // 2D/3D amplitude projection (will be built per-transform with actual keys)
+        // For now, leave empty; will be populated when needed
+        
+        ncm_cache_.build_token = token;
+    }
     
     // Helper to compute features per task dynamically
     // Formula: 3 views (1D, 2D, 3D) × (2 + radius + 1) features per view
@@ -4429,25 +5706,21 @@ public:
     ) : radius_(radius), nBits_(nBits), sim_thresh_(sim_thresh),
         stat_1d_(stat_1d), stat_2d_(stat_2d), stat_3d_(stat_3d),
         alpha_(alpha), num_threads_(num_threads), counting_method_(counting_method),
-        k_threshold_(2), use_key_loo_(use_key_loo), verbose_(verbose), is_fitted_(false) {}  // Fix initialization order
+        k_threshold_(2), use_key_loo_(use_key_loo), verbose_(verbose), 
+        ncm_(), is_fitted_(false) {}  // Fix initialization order - ncm_ defaults to NONE
     
-    // Build prevalence for all tasks
-    void fit(
+    // C++-only version: Build prevalence for all tasks (no Python dependencies)
+    void fit_cpp(
         const vector<string>& smiles,
-        const py::array_t<double>& Y_sparse_py,  // (n, n_tasks) with NaN
+        const vector<vector<double>>& Y_sparse,  // (n, n_tasks) with NaN as special value
         const vector<string>& task_names
     ) {
-        // Convert NumPy array to C++ 2D vector
-        auto buf = Y_sparse_py.request();
-        if (buf.ndim != 2) {
-            throw runtime_error("Y_sparse must be 2D array");
+        int n_molecules = smiles.size();
+        if (Y_sparse.empty() || Y_sparse[0].empty()) {
+            throw runtime_error("Y_sparse must be non-empty 2D array");
         }
-        
-        int n_molecules = buf.shape[0];
-        n_tasks_ = buf.shape[1];
+        n_tasks_ = Y_sparse[0].size();
         task_names_ = task_names;
-        
-        double* ptr = static_cast<double*>(buf.ptr);
         
         // Resize storage
         task_generators_.clear();
@@ -4487,7 +5760,7 @@ public:
             vector<int> labels_task;
             
             for (int i = 0; i < n_molecules; i++) {
-                double label = ptr[i * n_tasks_ + task_idx];
+                double label = Y_sparse[i][task_idx];
                 if (!std::isnan(label)) {
                     smiles_task.push_back(smiles[i]);
                     labels_task.push_back(static_cast<int>(label));
@@ -4501,42 +5774,286 @@ public:
             }
             int n_negative = n_measured - n_positive;
             
-            cout << "  Measured samples: " << n_measured << " (" 
-                 << (100.0*n_measured/n_molecules) << "%)\n";
-            cout << "  Positive: " << n_positive << " (" 
-                 << (100.0*n_positive/n_measured) << "%)\n";
-            cout << "  Negative: " << n_negative << " (" 
-                 << (100.0*n_negative/n_measured) << "%)\n";
-            
-            if (n_measured == 0) {
-                throw runtime_error("Task " + to_string(task_idx) + " has no measured samples!");
+            if (verbose_) {
+                cout << "  [" << task_names[task_idx] << "] Measured samples: " << n_measured << " (" 
+                     << (100.0*n_measured/n_molecules) << "%)\n";
+                cout << "  [" << task_names[task_idx] << "] Positive: " << n_positive << " (" 
+                     << (100.0*n_positive/n_measured) << "%)\n";
+                cout << "  [" << task_names[task_idx] << "] Negative: " << n_negative << " (" 
+                     << (100.0*n_negative/n_measured) << "%)\n";
             }
             
-            // Build prevalence using existing C++ code
-            cout << "  Building 1D prevalence...\n";
+            if (n_measured == 0) {
+                throw runtime_error("Task " + task_names[task_idx] + " has no measured samples!");
+            }
+            
+            // Extract keys first (needed for both old and fast paths)
+            if (verbose_) {
+                cout << "  [" << task_names[task_idx] << "] Extracting motif keys...\n";
+            }
+            auto all_keys = task_generators_[task_idx].get_all_motif_keys_batch_threaded(
+                smiles_task, radius_, num_threads_
+            );
+            
+            // Build 1D prevalence (fast, keep existing method)
+            if (verbose_) {
+                cout << "  [" << task_names[task_idx] << "] Building 1D prevalence...\n";
+            }
             auto prev_1d = task_generators_[task_idx].build_1d_ftp_stats_threaded(
                 smiles_task, labels_task, radius_, stat_1d_, alpha_, num_threads_
             );
             
-            cout << "  Building 2D prevalence...\n";
-            // Build pairs for 2D
-            // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
-            auto pairs = task_generators_[task_idx].make_pairs_balanced_cpp(
-                smiles_task, labels_task, 2, nBits_, sim_thresh_, 0
-            );
-            auto prev_2d = task_generators_[task_idx].build_2d_ftp_stats(
-                smiles_task, labels_task, pairs, radius_, prev_1d, stat_2d_, alpha_
-            );
+            // Build 2D/3D prevalence using FAST FIT (bitset-based co-occurrence counting)
+            // This is much faster than the naive approach, especially for large datasets
+            // Fast fit integration: Use bitset-based co-occurrence counting for 2D/3D prevalence
+            // This is much faster than the naive approach, especially for large datasets
+            // Fast fit DISABLED: Conversion from key pairs to molecule pairs causes combinatorial explosion
+            // The current approach generates O(n^2) molecule pairs per key pair, leading to memory issues
+            // TODO: Redesign fast fit to work directly with key pairs without converting to molecule pairs
+            bool use_fast_fit = false;  // DISABLED - causes memory explosion
+            map<string, double> prev_2d, prev_3d;
             
-            cout << "  Building 3D prevalence...\n";
-            // Build triplets for 3D
-            // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
-            auto triplets = task_generators_[task_idx].make_triplets_cpp(
-                smiles_task, labels_task, 2, nBits_, sim_thresh_
-            );
-            auto prev_3d = task_generators_[task_idx].build_3d_ftp_stats(
-                smiles_task, labels_task, triplets, radius_, prev_1d, stat_3d_, alpha_
-            );
+            if (use_fast_fit) {
+                if (verbose_) {
+                    cout << "  [" << task_names[task_idx] << "] Building 2D/3D prevalence using FAST FIT (bitset optimization)...\n";
+                }
+                
+                // Step 1: Create string->int key mapping
+                map<string, uint32_t> key_to_id;
+                vector<string> id_to_key;
+                uint32_t next_id = 0;
+                
+                // Collect all unique keys from all molecules
+                set<string> all_unique_keys;
+                for (const auto& keys_set : all_keys) {
+                    for (const auto& key : keys_set) {
+                        all_unique_keys.insert(key);
+                    }
+                }
+                
+                // Build mapping
+                for (const auto& key : all_unique_keys) {
+                    key_to_id[key] = next_id;
+                    id_to_key.push_back(key);
+                    next_id++;
+                }
+                
+                size_t orig_K = next_id;
+                cout << "    Unique keys: " << orig_K << "\n";
+                
+                // Step 2: Convert to MoleculeKeys format (vector of uint32_t per molecule)
+                vector<molftp::MoleculeKeys> mols_keys(n_measured);
+                for (size_t i = 0; i < n_measured; i++) {
+                    mols_keys[i].keys.reserve(all_keys[i].size());
+                    for (const auto& key : all_keys[i]) {
+                        auto it = key_to_id.find(key);
+                        if (it != key_to_id.end()) {
+                            mols_keys[i].keys.push_back(it->second);
+                        }
+                    }
+                    // Sort and remove duplicates
+                    sort(mols_keys[i].keys.begin(), mols_keys[i].keys.end());
+                    mols_keys[i].keys.erase(
+                        unique(mols_keys[i].keys.begin(), mols_keys[i].keys.end()),
+                        mols_keys[i].keys.end()
+                    );
+                }
+                
+                // Step 3: Determine n1d, n2d, n3d from features_per_view
+                // Features per view = 2 + radius + 1 (e.g., 9 for radius=6)
+                int features_per_view = 2 + radius_ + 1;
+                size_t n1d = features_per_view;  // Keep top n1d keys
+                size_t n2d = features_per_view;  // Keep top n2d pairs
+                size_t n3d = features_per_view;  // Keep top n3d triples
+                double min_prev = 0.0;  // Minimum prevalence threshold (0 = no filtering by prevalence)
+                
+                // Step 4: Call fast fit
+                molftp::FitConfig cfg{n1d, n2d, n3d, min_prev, num_threads_};
+                auto fast_result = molftp::fit_fast_bitset(mols_keys, orig_K, cfg);
+                
+                cout << "    Fast fit completed: " << fast_result.top2_pairs.size() 
+                     << " pairs, " << fast_result.top3_triples.size() << " triples\n";
+                
+                // Step 5: Convert fast fit results (key ID pairs) to molecule pairs
+                // Helper: Find molecules containing a key pair
+                auto find_molecules_with_key_pair = [&](const string& key_a, const string& key_b) -> vector<int> {
+                    vector<int> mol_indices;
+                    for (size_t i = 0; i < all_keys.size(); i++) {
+                        bool has_a = all_keys[i].count(key_a) > 0;
+                        bool has_b = all_keys[i].count(key_b) > 0;
+                        if (has_a && has_b) {
+                            mol_indices.push_back(static_cast<int>(i));
+                        }
+                    }
+                    return mol_indices;
+                };
+                
+                // Helper: Find molecules containing a key triple
+                auto find_molecules_with_key_triple = [&](const string& key_a, const string& key_b, const string& key_c) -> vector<int> {
+                    vector<int> mol_indices;
+                    for (size_t i = 0; i < all_keys.size(); i++) {
+                        if (all_keys[i].count(key_a) > 0 && 
+                            all_keys[i].count(key_b) > 0 && 
+                            all_keys[i].count(key_c) > 0) {
+                            mol_indices.push_back(static_cast<int>(i));
+                        }
+                    }
+                    return mol_indices;
+                };
+                
+                // Convert top key pairs to molecule pairs
+                set<pair<int, int>> pairs_fast_set;  // Use set to avoid duplicates
+                for (const auto& p : fast_result.top2_pairs) {
+                    uint32_t key_id_a = p.first;
+                    uint32_t key_id_b = p.second;
+                    
+                    if (key_id_a >= id_to_key.size() || key_id_b >= id_to_key.size()) {
+                        continue;  // Skip invalid key IDs
+                    }
+                    
+                    string key_a = id_to_key[key_id_a];
+                    string key_b = id_to_key[key_id_b];
+                    
+                    // Find molecules containing both keys
+                    vector<int> mols = find_molecules_with_key_pair(key_a, key_b);
+                    
+                    // Build molecule pairs from molecules containing this key pair
+                    // Limit to reasonable number to avoid explosion
+                    const size_t MAX_MOLS_PER_PAIR = 100;
+                    if (mols.size() > MAX_MOLS_PER_PAIR) {
+                        // Sample randomly if too many (use deterministic shuffle with seed)
+                        std::mt19937 rng(42);  // Fixed seed for reproducibility
+                        std::shuffle(mols.begin(), mols.end(), rng);
+                        mols.resize(MAX_MOLS_PER_PAIR);
+                    }
+                    
+                    for (size_t i = 0; i < mols.size(); i++) {
+                        for (size_t j = i + 1; j < mols.size(); j++) {
+                            int mol_i = mols[i];
+                            int mol_j = mols[j];
+                            if (mol_i < mol_j) {
+                                pairs_fast_set.insert({mol_i, mol_j});
+                            } else {
+                                pairs_fast_set.insert({mol_j, mol_i});
+                            }
+                        }
+                    }
+                }
+                
+                vector<pair<int, int>> pairs_fast(pairs_fast_set.begin(), pairs_fast_set.end());
+                cout << "    Converted to " << pairs_fast.size() << " molecule pairs\n";
+                
+                // Convert top key triples to molecule triples
+                set<tuple<int, int, int>> triplets_fast_set;  // Use set to avoid duplicates
+                for (const auto& t : fast_result.top3_triples) {
+                    uint32_t key_id_a = std::get<0>(t);
+                    uint32_t key_id_b = std::get<1>(t);
+                    uint32_t key_id_c = std::get<2>(t);
+                    
+                    if (key_id_a >= id_to_key.size() || key_id_b >= id_to_key.size() || key_id_c >= id_to_key.size()) {
+                        continue;  // Skip invalid key IDs
+                    }
+                    
+                    string key_a = id_to_key[key_id_a];
+                    string key_b = id_to_key[key_id_b];
+                    string key_c = id_to_key[key_id_c];
+                    
+                    // Find molecules containing all three keys
+                    vector<int> mols = find_molecules_with_key_triple(key_a, key_b, key_c);
+                    
+                    // Build molecule triples from molecules containing this key triple
+                    // Limit to reasonable number
+                    const size_t MAX_MOLS_PER_TRIPLE = 50;
+                    if (mols.size() > MAX_MOLS_PER_TRIPLE) {
+                        std::mt19937 rng(42);  // Fixed seed for reproducibility
+                        std::shuffle(mols.begin(), mols.end(), rng);
+                        mols.resize(MAX_MOLS_PER_TRIPLE);
+                    }
+                    
+                    for (size_t i = 0; i < mols.size(); i++) {
+                        for (size_t j = i + 1; j < mols.size(); j++) {
+                            for (size_t k = j + 1; k < mols.size(); k++) {
+                                int mol_i = mols[i];
+                                int mol_j = mols[j];
+                                int mol_k = mols[k];
+                                // Sort to ensure consistent ordering
+                                if (mol_i > mol_j) swap(mol_i, mol_j);
+                                if (mol_j > mol_k) swap(mol_j, mol_k);
+                                if (mol_i > mol_j) swap(mol_i, mol_j);
+                                triplets_fast_set.insert({mol_i, mol_j, mol_k});
+                            }
+                        }
+                    }
+                }
+                
+                vector<tuple<int, int, int>> triplets_fast(triplets_fast_set.begin(), triplets_fast_set.end());
+                cout << "    Converted to " << triplets_fast.size() << " molecule triples\n";
+                
+                // Step 6: Compute prevalence using existing methods with fast-fit pairs/triples
+                if (pairs_fast.size() > 0) {
+                    cout << "  Computing 2D prevalence from fast-fit pairs...\n";
+                    prev_2d = task_generators_[task_idx].build_2d_ftp_stats(
+                        smiles_task, labels_task, pairs_fast, radius_, prev_1d, stat_2d_, alpha_
+                    );
+                } else {
+                    cout << "  Warning: No molecule pairs generated from fast fit, using empty 2D prevalence\n";
+                    prev_2d = {};
+                }
+                
+                if (triplets_fast.size() > 0) {
+                    cout << "  Computing 3D prevalence from fast-fit triples...\n";
+                    // Convert tuple<int,int,int> to tuple<int,int,int,double,double> format expected by build_3d_ftp_stats
+                    vector<tuple<int, int, int, double, double>> triplets_with_sim;
+                    triplets_with_sim.reserve(triplets_fast.size());
+                    for (const auto& t : triplets_fast) {
+                        triplets_with_sim.push_back({
+                            std::get<0>(t), std::get<1>(t), std::get<2>(t), 
+                            1.0, 1.0  // Default similarity values (not used in 3D stats)
+                        });
+                    }
+                    prev_3d = task_generators_[task_idx].build_3d_ftp_stats(
+                        smiles_task, labels_task, triplets_with_sim, radius_, prev_1d, stat_3d_, alpha_
+                    );
+                } else {
+                    cout << "  Warning: No molecule triples generated from fast fit, using empty 3D prevalence\n";
+                    prev_3d = {};
+                }
+                
+                // Fall back to existing method if fast fit didn't produce enough results
+                if (pairs_fast.size() < n2d || triplets_fast.size() < n3d) {
+                    cout << "    Fast fit produced fewer pairs/triples than needed (" 
+                         << pairs_fast.size() << " pairs, " << triplets_fast.size() << " triples), "
+                         << "falling back to existing method...\n";
+                    use_fast_fit = false;
+                }
+            }
+            
+            if (!use_fast_fit || n_measured < 100) {
+                // Use existing method (fallback or small datasets)
+                if (verbose_) {
+                    cout << "  [" << task_names[task_idx] << "] Building 2D prevalence (existing method)...\n";
+                }
+                // Build pairs for 2D
+                // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
+                auto pairs = task_generators_[task_idx].make_pairs_balanced_cpp(
+                    smiles_task, labels_task, 2, nBits_, sim_thresh_, 0
+                );
+                prev_2d = task_generators_[task_idx].build_2d_ftp_stats(
+                    smiles_task, labels_task, pairs, radius_, prev_1d, stat_2d_, alpha_
+                );
+                
+                if (verbose_) {
+                    cout << "  [" << task_names[task_idx] << "] Building 3D prevalence (existing method)...\n";
+                }
+                // Build triplets for 3D
+                // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
+                auto triplets = task_generators_[task_idx].make_triplets_cpp(
+                    smiles_task, labels_task, 2, nBits_, sim_thresh_
+                );
+                prev_3d = task_generators_[task_idx].build_3d_ftp_stats(
+                    smiles_task, labels_task, triplets, radius_, prev_1d, stat_3d_, alpha_
+                );
+            }
             
             // Convert prevalence (map<string, double>) to prevalence_data format (map<string, map<string, double>>)
             // Positive values -> PASS, Negative values -> FAIL (sign flipped)
@@ -4573,11 +6090,11 @@ public:
             }
             
             // Key-LOO: Count keys on measured molecules only (ONLY if use_key_loo_ is true!)
+            // Note: all_keys was already extracted above for fast fit
             if (use_key_loo_) {
-                cout << "  Counting keys for Key-LOO filtering...\n";
-                auto all_keys = task_generators_[task_idx].get_all_motif_keys_batch_threaded(
-                    smiles_task, radius_, num_threads_
-                );
+                if (verbose_) {
+                    cout << "  [" << task_names[task_idx] << "] Counting keys for Key-LOO filtering...\n";
+                }
                 
                 map<string, int> key_mol_count;
                 map<string, int> key_tot_count;
@@ -4597,25 +6114,360 @@ public:
                 key_total_count_per_task_[task_idx] = key_tot_count;
                 n_measured_per_task_[task_idx] = n_measured;
             } else {
-                cout << "  Skipping Key-LOO filtering (Dummy-Masking mode)...\n";
+                if (verbose_) {
+                    cout << "  [" << task_names[task_idx] << "] Skipping Key-LOO filtering (Dummy-Masking mode)...\n";
+                }
                 // For Dummy-Masking: No Key-LOO, so leave counts empty
                 key_molecule_count_per_task_[task_idx] = {};
                 key_total_count_per_task_[task_idx] = {};
                 n_measured_per_task_[task_idx] = 0;  // Not used in Dummy-Masking
             }
             
-            cout << "  ✅ Prevalence built for " << task_names[task_idx] << "\n";
+            if (verbose_) {
+                cout << "  ✅ [" << task_names[task_idx] << "] Prevalence built successfully\n";
+            }
         }
         
         is_fitted_ = true;
         
-        cout << "\n" << string(80, '=') << "\n";
-        cout << "✅ ALL TASK PREVALENCE BUILT (C++)!\n";
-        cout << string(80, '=') << "\n";
-        cout << "Total tasks: " << n_tasks_ << "\n";
-        cout << "Features per task: " << get_features_per_task() << " (1D + 2D + 3D)\n";
-        cout << "Total features: " << (n_tasks_ * get_features_per_task()) << "\n";
-        cout << string(80, '=') << "\n";
+        if (verbose_) {
+            cout << "\n" << string(80, '=') << "\n";
+            cout << "✅ ALL TASK PREVALENCE BUILT (C++)!\n";
+            cout << string(80, '=') << "\n";
+            cout << "Total tasks: " << n_tasks_ << "\n";
+            cout << "Features per task: " << get_features_per_task() << " (1D + 2D + 3D)\n";
+            cout << "Total features: " << (n_tasks_ * get_features_per_task()) << "\n";
+            cout << string(80, '=') << "\n";
+        }
+        
+        // Cache sizes so we can allocate train-presence quickly during transform.
+        // Count unique keys from prevalence data
+        K1_ = prevalence_data_1d_per_task_[0]["PASS"].size() + prevalence_data_1d_per_task_[0]["FAIL"].size();
+        K2_ = prevalence_data_2d_per_task_[0]["PASS"].size() + prevalence_data_2d_per_task_[0]["FAIL"].size();
+        K3_ = prevalence_data_3d_per_task_[0]["PASS"].size() + prevalence_data_3d_per_task_[0]["FAIL"].size();
+        
+        // If you already compute per-1D key radius, move it into key_radius_1d_ here.
+        // If not available, leave parents_1d_ empty; NCM will safely fall back.
+        // Optionally populate parents_1d_ while emitting higher-radius keys:
+        // parents_1d_[k_r].push_back(k_r_minus_1);
+    }
+    
+    // --- New setters (safe to call from Python) ---
+    void set_proximity_mode(const std::string& mode) {
+      if      (mode == "none")         ncm_.mode = ProximityMode::NONE;
+      else if (mode == "hier_mask")    ncm_.mode = ProximityMode::HIER_MASK;
+      else if (mode == "hier_backoff") ncm_.mode = ProximityMode::HIER_BACKOFF;
+      else throw std::runtime_error("Unknown proximity_mode: " + mode);
+    }
+    void set_proximity_params(int dmax, double lambda, bool train_only=true) {
+      if (dmax < 0) dmax = 0;
+      ncm_.dmax = dmax; ncm_.lambda = lambda; ncm_.train_only = train_only;
+    }
+    // Convenience wrapper to configure hierarchical proximity parameters.
+    void set_notclose_masking(int gap, int min_parent_depth, bool require_all_components, bool debug) {
+      ncm_.dmax = std::max(0, gap);
+      ncm_.min_parent_depth = std::max(0, min_parent_depth);
+      ncm_.require_all_components = require_all_components;
+      // Note: debug flag could be stored in a separate member if needed
+      // For now, we'll skip it as it's mainly for verbose logging
+    }
+    
+    // Configure statistical backoff: apply hierarchical backoff only when key count < threshold
+    void set_statistical_backoff(int threshold, int dmax, double lambda) {
+      if (threshold < 1) threshold = 1;
+      if (dmax < 0) dmax = 0;
+      stat_backoff_.mode = StatisticalBackoffMode::COUNT_THRESHOLD;
+      stat_backoff_.threshold = threshold;
+      stat_backoff_.dmax = dmax;
+      stat_backoff_.lambda = lambda;
+      stat_backoff_.use_train_counts = true;
+    }
+    
+    // Configure target-aware amplitude for NCM
+    void set_proximity_amplitude(int source, float prior_alpha, float gamma,
+                                  float cap_min, float cap_max, bool apply_to_train_rows) {
+      ncm_amp_.source = static_cast<ProximityAmpSource>(source);
+      ncm_amp_.prior_alpha = prior_alpha;
+      ncm_amp_.gamma = gamma;
+      ncm_amp_.cap_min = cap_min;
+      ncm_amp_.cap_max = cap_max;
+      ncm_amp_.apply_to_train_rows = apply_to_train_rows;
+    }
+    
+    // Set component policy: first-component-only (faster) vs min-over-components (more conservative)
+    void set_proximity_amp_components_policy(bool first_component_only) {
+      ncm_amp_.first_component_only = first_component_only;
+    }
+    
+    // Set distance decay beta: 0 = off, else decay by (1/(1+d))^beta
+    void set_proximity_amp_distance_beta(float dist_beta) {
+      ncm_amp_.dist_beta = dist_beta;
+    }
+    
+    // Python wrapper: converts pybind11 array to C++ vector and calls fit_cpp
+    void fit(
+        const vector<string>& smiles,
+        const py::array_t<double>& Y_sparse_py,  // (n, n_tasks) with NaN
+        const vector<string>& task_names
+    ) {
+        // Convert NumPy array to C++ 2D vector
+        auto buf = Y_sparse_py.request();
+        if (buf.ndim != 2) {
+            throw runtime_error("Y_sparse must be 2D array");
+        }
+        
+        int n_molecules = buf.shape[0];
+        int n_tasks = buf.shape[1];
+        double* ptr = static_cast<double*>(buf.ptr);
+        
+        // Convert to vector<vector<double>>
+        vector<vector<double>> Y_sparse(n_molecules, vector<double>(n_tasks));
+        for (int i = 0; i < n_molecules; i++) {
+            for (int j = 0; j < n_tasks; j++) {
+                Y_sparse[i][j] = ptr[i * n_tasks + j];
+            }
+        }
+        
+        // Call C++-only version
+        fit_cpp(smiles, Y_sparse, task_names);
+    }
+    
+    // C++-only version: Transform molecules to features (no Python dependencies)
+    // Returns flat vector: [mol0_feat0, mol0_feat1, ..., mol0_featN, mol1_feat0, ...]
+    vector<double> transform_cpp(const vector<string>& smiles, 
+                                 const vector<bool>* train_row_mask = nullptr) {
+        if (!is_fitted_) {
+            throw runtime_error("Must call fit() first");
+        }
+        
+        int n_molecules = smiles.size();
+        int features_per_task = get_features_per_task();
+        int n_features_total = n_tasks_ * features_per_task;
+        
+        // Determine if we should apply Key-LOO rescaling
+        bool apply_key_loo_rescaling = false;
+        if (use_key_loo_ && train_row_mask != nullptr) {
+            for (size_t i = 0; i < train_row_mask->size() && i < (size_t)n_molecules; i++) {
+                if ((*train_row_mask)[i]) {
+                    apply_key_loo_rescaling = true;
+                    break;
+                }
+            }
+        }
+        
+        if (verbose_) {
+            cout << "\n" << string(80, '=') << "\n";
+            cout << "TRANSFORMING TO MULTI-TASK FEATURES (C++)\n";
+            cout << string(80, '=') << "\n";
+            cout << "Molecules: " << n_molecules << "\n";
+            cout << "Total features: " << n_features_total << "\n";
+            if (use_key_loo_) {
+                cout << "Key-LOO rescaling: " << (apply_key_loo_rescaling ? "YES (training)" : "NO (inference)") << "\n";
+            }
+        }
+        
+        // Allocate output vector
+        vector<double> result(n_molecules * n_features_total, 0.0);
+        
+        // Build NCM context if NCM is enabled
+        NCMContext ncm_ctx_local;
+        NCMContext* ncm_ctx_ptr = nullptr;
+        if (ncm_.mode != ProximityMode::NONE || ncm_amp_.source != PROXAMP_OFF) {
+            ncm_ctx_local.cfg = &ncm_;
+            ncm_ctx_local.tp = nullptr;  // Will be built in build_3view_vectors_batch from train_row_mask
+            ncm_ctx_local.st = nullptr;  // Not needed for current implementation
+            ncm_ctx_local.is_train_row = false;  // Per-molecule flag set in build_3view_vectors_batch
+            ncm_ctx_local.amp = ncm_amp_;  // Copy amplitude params
+            ncm_ctx_ptr = &ncm_ctx_local;
+        }
+        
+        // Convert train_row_mask to vector<bool> if provided
+        std::vector<bool> train_mask_bool;
+        if (train_row_mask != nullptr) {
+            train_mask_bool.reserve(train_row_mask->size());
+            for (size_t i = 0; i < train_row_mask->size(); ++i) {
+                train_mask_bool.push_back((*train_row_mask)[i]);
+            }
+        }
+        
+        // Transform each task
+        for (int task_idx = 0; task_idx < n_tasks_; task_idx++) {
+            // --- Build NCM cache ONCE per task (FASTPATH optimization) ---
+            if (ncm_.mode != ProximityMode::NONE || ncm_amp_.source != PROXAMP_OFF) {
+                ensure_ncm_cache_built(train_mask_bool, task_idx);
+            }
+            if (verbose_) {
+                cout << "  Task " << (task_idx+1) << "/" << n_tasks_ 
+                     << " (" << task_names_[task_idx] << ")... " << flush;
+            }
+            
+            // Choose transform method based on use_key_loo_ flag
+            std::tuple<vector<vector<double>>, vector<vector<double>>, vector<vector<double>>> result_tuple;
+            
+            if (use_key_loo_) {
+                // Pass statistical backoff config if enabled
+                const StatisticalBackoffConfig* stat_backoff_ptr = nullptr;
+                const map<string, int>* key_counts_ptr = nullptr;
+                if (stat_backoff_.mode == StatisticalBackoffMode::COUNT_THRESHOLD) {
+                    stat_backoff_ptr = &stat_backoff_;
+                    key_counts_ptr = &key_molecule_count_per_task_[task_idx];
+                }
+                
+                result_tuple = task_generators_[task_idx].build_vectors_with_key_loo_fixed(
+                    smiles, radius_,
+                    prevalence_data_1d_per_task_[task_idx],
+                    prevalence_data_2d_per_task_[task_idx],
+                    prevalence_data_3d_per_task_[task_idx],
+                    key_molecule_count_per_task_[task_idx],
+                    key_total_count_per_task_[task_idx],
+                    key_molecule_count_per_task_[task_idx],
+                    key_total_count_per_task_[task_idx],
+                    key_molecule_count_per_task_[task_idx],
+                    key_total_count_per_task_[task_idx],
+                    n_measured_per_task_[task_idx],
+                    k_threshold_,
+                    apply_key_loo_rescaling,
+                    "max",
+                    1.0,
+                    ncm_ctx_ptr,
+                    train_row_mask,
+                    key_counts_ptr,
+                    stat_backoff_ptr
+                );
+            } else {
+                map<string, int> empty_counts;
+                result_tuple = task_generators_[task_idx].build_vectors_with_key_loo_fixed(
+                    smiles, radius_,
+                    prevalence_data_1d_per_task_[task_idx],
+                    prevalence_data_2d_per_task_[task_idx],
+                    prevalence_data_3d_per_task_[task_idx],
+                    empty_counts, empty_counts, empty_counts,
+                    empty_counts, empty_counts, empty_counts,
+                    0, 0, false, "max", 1.0,
+                    ncm_ctx_ptr,
+                    train_row_mask
+                );
+            }
+            
+            // Unpack tuple
+            auto& V1 = std::get<0>(result_tuple);
+            auto& V2 = std::get<1>(result_tuple);
+            auto& V3 = std::get<2>(result_tuple);
+            
+            // Copy to output (task_idx * features_per_task offset)
+            int features_per_view = features_per_task / 3;
+            int offset = task_idx * features_per_task;
+            for (int mol_idx = 0; mol_idx < n_molecules; mol_idx++) {
+                // Copy 1D features
+                for (int i = 0; i < features_per_view; i++) {
+                    result[mol_idx * n_features_total + offset + i] = V1[mol_idx][i];
+                }
+                // Copy 2D features
+                for (int i = 0; i < features_per_view; i++) {
+                    result[mol_idx * n_features_total + offset + features_per_view + i] = V2[mol_idx][i];
+                }
+                // Copy 3D features
+                for (int i = 0; i < features_per_view; i++) {
+                    result[mol_idx * n_features_total + offset + 2*features_per_view + i] = V3[mol_idx][i];
+                }
+            }
+            
+            if (verbose_) {
+                cout << "✅ (" << features_per_task << " features)\n";
+            }
+        }
+        
+        if (verbose_) {
+            cout << "\n✅ Multi-task features created (C++):\n";
+            cout << "   Shape: (" << n_molecules << ", " << n_features_total << ")\n";
+            cout << "   Features per task: " << features_per_task << "\n";
+            cout << "   Total features: " << n_features_total << "\n";
+            cout << string(80, '=') << "\n";
+        }
+        
+        return result;
+    }
+    
+    // C++-only version: Transform with dummy masking
+    vector<double> transform_with_dummy_masking_cpp(
+        const vector<string>& smiles,
+        const vector<vector<int>>& train_indices_per_task
+    ) {
+        if (!is_fitted_) {
+            throw runtime_error("Must call fit() first");
+        }
+        
+        if (train_indices_per_task.size() != n_tasks_) {
+            throw runtime_error("train_indices_per_task must have " + to_string(n_tasks_) + " elements");
+        }
+        
+        int n_molecules = smiles.size();
+        int features_per_task = get_features_per_task();
+        int n_features_total = n_tasks_ * features_per_task;
+        
+        if (verbose_) {
+            cout << "\n" << string(80, '=') << "\n";
+            cout << "TRANSFORMING WITH DUMMY-MASKING (C++)\n";
+            cout << string(80, '=') << "\n";
+            cout << "Molecules: " << n_molecules << "\n";
+            cout << "Total features: " << n_features_total << "\n";
+            cout << "Method: Dummy-Masking (mask test-only keys)\n";
+        }
+        
+        // Allocate output vector
+        vector<double> result(n_molecules * n_features_total, 0.0);
+        
+        // Transform each task with dummy masking
+        for (int task_idx = 0; task_idx < n_tasks_; task_idx++) {
+            if (verbose_) {
+                cout << "  Task " << (task_idx+1) << "/" << n_tasks_ 
+                     << " (" << task_names_[task_idx] << ")... " << flush;
+            }
+            
+            const vector<int>& train_indices = train_indices_per_task[task_idx];
+            vector<int> dummy_labels(n_molecules, 0);
+            vector<vector<int>> cv_splits = {train_indices};
+            
+            auto [cv_results, masking_stats] = task_generators_[task_idx].build_cv_vectors_with_dummy_masking(
+                smiles, dummy_labels, radius_,
+                prevalence_data_1d_per_task_[task_idx],
+                prevalence_data_2d_per_task_[task_idx],
+                prevalence_data_3d_per_task_[task_idx],
+                cv_splits, 0.0, "total", num_threads_, "max", 1.0
+            );
+            
+            const auto& V1 = cv_results[0][0];
+            const auto& V2 = cv_results[0][1];
+            const auto& V3 = cv_results[0][2];
+            
+            int features_per_view = features_per_task / 3;
+            int offset = task_idx * features_per_task;
+            
+            for (int mol_idx = 0; mol_idx < n_molecules; mol_idx++) {
+                for (int i = 0; i < features_per_view; i++) {
+                    result[mol_idx * n_features_total + offset + i] = V1[mol_idx][i];
+                }
+                for (int i = 0; i < features_per_view; i++) {
+                    result[mol_idx * n_features_total + offset + features_per_view + i] = V2[mol_idx][i];
+                }
+                for (int i = 0; i < features_per_view; i++) {
+                    result[mol_idx * n_features_total + offset + 2*features_per_view + i] = V3[mol_idx][i];
+                }
+            }
+            
+            if (verbose_) {
+                cout << "✅ (" << features_per_task << " features, "
+                     << "masked " << masking_stats[0]["masked_keys_1d"] << " 1D keys)\n";
+            }
+        }
+        
+        if (verbose_) {
+            cout << "\n✅ Multi-task Dummy-Masking features created (C++):\n";
+            cout << "   Shape: (" << n_molecules << ", " << n_features_total << ")\n";
+            cout << string(80, '=') << "\n";
+        }
+        
+        return result;
     }
     
     // Wrapper for Python: accepts optional train_row_mask as Python list/array
@@ -4648,218 +6500,35 @@ public:
             }
         }
         
-        return transform(smiles, train_row_mask_ptr);
-    }
-    
-    // Transform: compute fragments once, generate features for all tasks
-    py::array_t<double> transform(const vector<string>& smiles, 
-                                   const vector<bool>* train_row_mask = nullptr) {
-        if (!is_fitted_) {
-            throw runtime_error("Must call fit() first");
-        }
+        // Call C++-only version
+        vector<double> result_flat = transform_cpp(smiles, train_row_mask_ptr);
         
+        // Convert to pybind11 array
         int n_molecules = smiles.size();
-        int features_per_task = get_features_per_task();
-        int n_features_total = n_tasks_ * features_per_task;
-        
-        // FIXED: Determine if we should apply Key-LOO rescaling
-        // Rescaling should ONLY be applied to training molecules, never at inference
-        bool apply_key_loo_rescaling = false;
-        if (use_key_loo_ && train_row_mask != nullptr) {
-            // Check if any rows are marked as training
-            for (size_t i = 0; i < train_row_mask->size() && i < (size_t)n_molecules; i++) {
-                if ((*train_row_mask)[i]) {
-                    apply_key_loo_rescaling = true;
-                    break;
-                }
-            }
-        }
-        // If train_row_mask is nullptr or all false, this is inference → no rescaling
-        
-        cout << "\n" << string(80, '=') << "\n";
-        cout << "TRANSFORMING TO MULTI-TASK FEATURES (C++)\n";
-        cout << string(80, '=') << "\n";
-        cout << "Molecules: " << n_molecules << "\n";
-        cout << "Total features: " << n_features_total << "\n";
-        if (use_key_loo_) {
-            cout << "Key-LOO rescaling: " << (apply_key_loo_rescaling ? "YES (training)" : "NO (inference)") << "\n";
-        }
-        
-        // Allocate output array
+        int n_features_total = get_n_features();
         py::array_t<double> result({n_molecules, n_features_total});
         auto buf = result.request();
         double* ptr = static_cast<double*>(buf.ptr);
-        
-        // Transform each task
-        for (int task_idx = 0; task_idx < n_tasks_; task_idx++) {
-            cout << "  Task " << (task_idx+1) << "/" << n_tasks_ 
-                 << " (" << task_names_[task_idx] << ")... " << flush;
-            
-            // Choose transform method based on use_key_loo_ flag
-            std::tuple<vector<vector<double>>, vector<vector<double>>, vector<vector<double>>> result_tuple;
-            
-            if (use_key_loo_) {
-                // Key-LOO: Filter keys based on occurrence counts
-                // FIXED: Only apply rescaling for training molecules, never at inference
-                result_tuple = task_generators_[task_idx].build_vectors_with_key_loo_fixed(
-                    smiles, radius_,
-                    prevalence_data_1d_per_task_[task_idx],
-                    prevalence_data_2d_per_task_[task_idx],
-                    prevalence_data_3d_per_task_[task_idx],
-                    key_molecule_count_per_task_[task_idx],
-                    key_total_count_per_task_[task_idx],
-                    key_molecule_count_per_task_[task_idx],
-                    key_total_count_per_task_[task_idx],
-                    key_molecule_count_per_task_[task_idx],
-                    key_total_count_per_task_[task_idx],
-                    n_measured_per_task_[task_idx],
-                    k_threshold_,
-                    apply_key_loo_rescaling,  // FIXED: Only true for training, false for inference
-                    "max",  // FIXED: Match Python PrevalenceGenerator default
-                    1.0
-                );
-            } else {
-                // Dummy-Masking: Simple prevalence, NO Key-LOO filtering!
-                // Pass EMPTY key counts and k=0 to disable filtering
-                map<string, int> empty_counts;
-                result_tuple = task_generators_[task_idx].build_vectors_with_key_loo_fixed(
-                    smiles, radius_,
-                    prevalence_data_1d_per_task_[task_idx],
-                    prevalence_data_2d_per_task_[task_idx],
-                    prevalence_data_3d_per_task_[task_idx],
-                    empty_counts,  // Empty = no filtering
-                    empty_counts,
-                    empty_counts,
-                    empty_counts,
-                    empty_counts,
-                    empty_counts,
-                    0,  // n_measured = 0 (not used when counts are empty)
-                    0,  // k_threshold = 0 (disabled)
-                    false,  // rescale_n_minus_k = false (no rescaling)
-                    "max",  // FIXED: Match Python PrevalenceGenerator default
-                    1.0
-                );
-            }
-            
-            // Unpack tuple
-            auto& V1 = std::get<0>(result_tuple);  // vector<vector<double>> of size n_molecules × features_per_view
-            auto& V2 = std::get<1>(result_tuple);  // vector<vector<double>> of size n_molecules × features_per_view
-            auto& V3 = std::get<2>(result_tuple);  // vector<vector<double>> of size n_molecules × features_per_view
-            
-            // Copy to output (task_idx * features_per_task offset)
-            int features_per_view = features_per_task / 3;  // 9 for radius=6
-            int offset = task_idx * features_per_task;
-            for (int mol_idx = 0; mol_idx < n_molecules; mol_idx++) {
-                // Copy 1D features
-                for (int i = 0; i < features_per_view; i++) {
-                    ptr[mol_idx * n_features_total + offset + i] = V1[mol_idx][i];
-                }
-                // Copy 2D features
-                for (int i = 0; i < features_per_view; i++) {
-                    ptr[mol_idx * n_features_total + offset + features_per_view + i] = V2[mol_idx][i];
-                }
-                // Copy 3D features
-                for (int i = 0; i < features_per_view; i++) {
-                    ptr[mol_idx * n_features_total + offset + 2*features_per_view + i] = V3[mol_idx][i];
-                }
-            }
-            
-            cout << "✅ (" << features_per_task << " features)\n";
-        }
-        
-        cout << "\n✅ Multi-task features created (C++):\n";
-        cout << "   Shape: (" << n_molecules << ", " << n_features_total << ")\n";
-        cout << "   Features per task: " << features_per_task << "\n";
-        cout << "   Total features: " << n_features_total << "\n";
-        cout << string(80, '=') << "\n";
+        std::memcpy(ptr, result_flat.data(), result_flat.size() * sizeof(double));
         
         return result;
     }
     
-    // NEW: Dummy-Masking transform - applies per-fold key masking
+    // Python wrapper: converts pybind11 array and calls transform_cpp
     py::array_t<double> transform_with_dummy_masking(
         const vector<string>& smiles,
-        const vector<vector<int>>& train_indices_per_task  // train_indices[task_idx] = indices of training mols for this task
+        const vector<vector<int>>& train_indices_per_task
     ) {
-        if (!is_fitted_) {
-            throw runtime_error("Must call fit() first");
-        }
+        // Call C++-only version
+        vector<double> result_flat = transform_with_dummy_masking_cpp(smiles, train_indices_per_task);
         
-        if (train_indices_per_task.size() != n_tasks_) {
-            throw runtime_error("train_indices_per_task must have " + to_string(n_tasks_) + " elements");
-        }
-        
+        // Convert to pybind11 array
         int n_molecules = smiles.size();
-        int features_per_task = get_features_per_task();
-        int n_features_total = n_tasks_ * features_per_task;
-        
-        cout << "\n" << string(80, '=') << "\n";
-        cout << "TRANSFORMING WITH DUMMY-MASKING (C++)\n";
-        cout << string(80, '=') << "\n";
-        cout << "Molecules: " << n_molecules << "\n";
-        cout << "Total features: " << n_features_total << "\n";
-        cout << "Method: Dummy-Masking (mask test-only keys)\n";
-        
-        // Allocate output array
+        int n_features_total = get_n_features();
         py::array_t<double> result({n_molecules, n_features_total});
         auto buf = result.request();
         double* ptr = static_cast<double*>(buf.ptr);
-        
-        // Transform each task with dummy masking
-        for (int task_idx = 0; task_idx < n_tasks_; task_idx++) {
-            cout << "  Task " << (task_idx+1) << "/" << n_tasks_ 
-                 << " (" << task_names_[task_idx] << ")... " << flush;
-            
-            const vector<int>& train_indices = train_indices_per_task[task_idx];
-            
-            // Use build_cv_vectors_with_dummy_masking for this task
-            vector<int> dummy_labels(n_molecules, 0);  // Not used by dummy_masking
-            vector<vector<int>> cv_splits = {train_indices};  // Single fold
-            
-            auto [cv_results, masking_stats] = task_generators_[task_idx].build_cv_vectors_with_dummy_masking(
-                smiles, dummy_labels, radius_,
-                prevalence_data_1d_per_task_[task_idx],
-                prevalence_data_2d_per_task_[task_idx],
-                prevalence_data_3d_per_task_[task_idx],
-                cv_splits,
-                0.0,  // dummy_value
-                "total",  // mode
-                num_threads_,
-                "max",  // FIXED: Match Python PrevalenceGenerator default
-                1.0  // softmax_temperature
-            );
-            
-            // Extract features from fold 0
-            const auto& V1 = cv_results[0][0];  // [fold][view][molecule]
-            const auto& V2 = cv_results[0][1];
-            const auto& V3 = cv_results[0][2];
-            
-            // Copy to output
-            int features_per_view = features_per_task / 3;
-            int offset = task_idx * features_per_task;
-            
-            for (int mol_idx = 0; mol_idx < n_molecules; mol_idx++) {
-                // 1D features
-                for (int i = 0; i < features_per_view; i++) {
-                    ptr[mol_idx * n_features_total + offset + i] = V1[mol_idx][i];
-                }
-                // 2D features
-                for (int i = 0; i < features_per_view; i++) {
-                    ptr[mol_idx * n_features_total + offset + features_per_view + i] = V2[mol_idx][i];
-                }
-                // 3D features
-                for (int i = 0; i < features_per_view; i++) {
-                    ptr[mol_idx * n_features_total + offset + 2*features_per_view + i] = V3[mol_idx][i];
-                }
-            }
-            
-            cout << "✅ (" << features_per_task << " features, "
-                 << "masked " << masking_stats[0]["masked_keys_1d"] << " 1D keys)\n";
-        }
-        
-        cout << "\n✅ Multi-task Dummy-Masking features created (C++):\n";
-        cout << "   Shape: (" << n_molecules << ", " << n_features_total << ")\n";
-        cout << string(80, '=') << "\n";
+        std::memcpy(ptr, result_flat.data(), result_flat.size() * sizeof(double));
         
         return result;
     }
@@ -4870,6 +6539,10 @@ public:
     
     int get_n_tasks() const { 
         return n_tasks_; 
+    }
+    
+    void set_verbose(bool verbose) {
+        verbose_ = verbose;
     }
     
     bool is_fitted() const {
@@ -4938,7 +6611,8 @@ public:
 };
 
 
-// Python bindings
+// Python bindings (only compile when not building Boost.Python)
+#ifndef BOOST_PYTHON_BUILD
 PYBIND11_MODULE(_molftp, m) {
     m.doc() = "Vectorized Fragment-Target Prevalence (molFTP) with 3 Counting Methods + Multi-Task Support";
     
@@ -4980,17 +6654,57 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("smiles"), py::arg("radius"))
         .def("get_all_motif_keys_batch", &VectorizedFTPGenerator::get_all_motif_keys_batch,
              py::arg("smiles"), py::arg("radius"))
-        .def("build_3view_vectors_batch", &VectorizedFTPGenerator::build_3view_vectors_batch,
+        .def("build_3view_vectors_batch",
+             [](VectorizedFTPGenerator& self,
+                const vector<string>& smiles, int radius,
+                const map<string, map<string, double>>& prevalence_data_1d,
+                const map<string, map<string, double>>& prevalence_data_2d,
+                const map<string, map<string, double>>& prevalence_data_3d,
+                double atom_gate = 0.0,
+                const string& atom_aggregation = "max",
+                double softmax_temperature = 1.0,
+                py::object ncm_ctx_obj = py::none(),
+                py::object train_row_mask_obj = py::none()) {
+                 const NCMContext* ncm_ctx = nullptr;
+                 const vector<bool>* train_row_mask = nullptr;
+                 // Note: NCM context is internal-only, not exposed to Python
+                 return self.build_3view_vectors_batch(
+                     smiles, radius,
+                     prevalence_data_1d, prevalence_data_2d, prevalence_data_3d,
+                     atom_gate, atom_aggregation, softmax_temperature,
+                     ncm_ctx, train_row_mask);
+             },
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
-             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
+             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
+             py::arg("ncm_ctx") = py::none(), py::arg("train_row_mask") = py::none())
         .def("generate_ftp_vector", &VectorizedFTPGenerator::generate_ftp_vector,
              py::arg("smiles"), py::arg("radius"), py::arg("prevalence_data"), py::arg("atom_gate") = 0.0, 
              py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
-        .def("build_3view_vectors", &VectorizedFTPGenerator::build_3view_vectors,
+        .def("build_3view_vectors",
+             [](VectorizedFTPGenerator& self,
+                const vector<string>& smiles, int radius,
+                const map<string, map<string, double>>& prevalence_data_1d,
+                const map<string, map<string, double>>& prevalence_data_2d,
+                const map<string, map<string, double>>& prevalence_data_3d,
+                double atom_gate = 0.0,
+                const string& atom_aggregation = "max",
+                double softmax_temperature = 1.0,
+                py::object ncm_ctx_obj = py::none(),
+                py::object train_row_mask_obj = py::none()) {
+                 const NCMContext* ncm_ctx = nullptr;
+                 const vector<bool>* train_row_mask = nullptr;
+                 // Note: NCM context is internal-only, not exposed to Python
+                 return self.build_3view_vectors(
+                     smiles, radius,
+                     prevalence_data_1d, prevalence_data_2d, prevalence_data_3d,
+                     atom_gate, atom_aggregation, softmax_temperature,
+                     ncm_ctx, train_row_mask);
+             },
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
-             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0)
+             py::arg("atom_gate") = 0.0, py::arg("atom_aggregation") = "max", py::arg("softmax_temperature") = 1.0,
+             py::arg("ncm_ctx") = py::none(), py::arg("train_row_mask") = py::none())
         .def("build_3view_vectors_mode", &VectorizedFTPGenerator::build_3view_vectors_mode,
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
              py::arg("prevalence_data_1d"), py::arg("prevalence_data_2d"), py::arg("prevalence_data_3d"),
@@ -5029,7 +6743,35 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("smiles"), py::arg("labels"), py::arg("radius"),
              py::arg("prevalence_data_1d_full"), py::arg("prevalence_data_2d_full"), py::arg("prevalence_data_3d_full"),
              py::arg("k_threshold") = 1, py::arg("mode") = "total", py::arg("num_threads") = 0, py::arg("rescale_n_minus_k") = false, py::arg("atom_aggregation") = "max")
-        .def("build_vectors_with_key_loo_fixed", &VectorizedFTPGenerator::build_vectors_with_key_loo_fixed,
+        .def("build_vectors_with_key_loo_fixed", 
+             [](VectorizedFTPGenerator& self,
+                const vector<string>& smiles, int radius,
+                const map<string, map<string, double>>& prevalence_data_1d_full,
+                const map<string, map<string, double>>& prevalence_data_2d_full,
+                const map<string, map<string, double>>& prevalence_data_3d_full,
+                const map<string, int>& key_molecule_count_1d,
+                const map<string, int>& key_total_count_1d,
+                const map<string, int>& key_molecule_count_2d,
+                const map<string, int>& key_total_count_2d,
+                const map<string, int>& key_molecule_count_3d,
+                const map<string, int>& key_total_count_3d,
+                int n_molecules_full,
+                int k_threshold = 1,
+                bool rescale_n_minus_k = false,
+                const string& atom_aggregation = "max",
+                double softmax_temperature = 1.0) {
+                 return self.build_vectors_with_key_loo_fixed(
+                     smiles, radius,
+                     prevalence_data_1d_full, prevalence_data_2d_full, prevalence_data_3d_full,
+                     key_molecule_count_1d, key_total_count_1d,
+                     key_molecule_count_2d, key_total_count_2d,
+                     key_molecule_count_3d, key_total_count_3d,
+                     n_molecules_full,
+                     k_threshold, rescale_n_minus_k,
+                     atom_aggregation, softmax_temperature,
+                     nullptr, nullptr  // NCM context and train_row_mask (internal only)
+                 );
+             },
              py::arg("smiles"), py::arg("radius"),
              py::arg("prevalence_data_1d_full"), py::arg("prevalence_data_2d_full"), py::arg("prevalence_data_3d_full"),
              py::arg("key_molecule_count_1d"), py::arg("key_total_count_1d"),
@@ -5103,8 +6845,110 @@ PYBIND11_MODULE(_molftp, m) {
              "Get total number of features (n_tasks * features_per_task, where features_per_task = 3 * (2 + radius + 1))")
         .def("get_n_tasks", &MultiTaskPrevalenceGenerator::get_n_tasks,
              "Get number of tasks")
+        .def("set_verbose", &MultiTaskPrevalenceGenerator::set_verbose,
+             py::arg("verbose"),
+             "Set verbose mode (True to enable debug messages, False to disable)")
         .def("is_fitted", &MultiTaskPrevalenceGenerator::is_fitted,
              "Check if model is fitted")
+        .def("set_proximity_mode",
+             &MultiTaskPrevalenceGenerator::set_proximity_mode,
+             py::arg("mode"),
+             R"doc(
+               Set proximity mode: "none" | "hier_mask" | "hier_backoff".
+               Default: "none".
+             )doc")
+        .def("set_proximity_params",
+             [](MultiTaskPrevalenceGenerator& self, int dmax, double lambda_val, bool train_only) {
+                 self.set_proximity_params(dmax, lambda_val, train_only);
+             },
+             py::arg("dmax")=0, py::arg("lambda_val")=0.5, py::arg("train_only")=true,
+             R"doc(
+               Set proximity parameters.
+                 - dmax: maximum distance (0 reproduces Dummy-Masking behavior for unseen keys)
+                 - lambda_val: decay factor for backoff (ignored for 'hier_mask')
+                 - train_only: must remain True to avoid leakage (keys are considered "seen" only if present in TRAIN)
+             )doc")
+        .def("set_notclose_masking",
+             &MultiTaskPrevalenceGenerator::set_notclose_masking,
+             py::arg("gap")=1, py::arg("min_parent_depth")=0, py::arg("require_all_components")=true, py::arg("debug")=false,
+             R"doc(
+               Configure Not-Close Masking (NCM) / hierarchical proximity parameters.
+                 - gap: dmax (maximum distance for ancestor climbing)
+                 - min_parent_depth: floor for ancestor climbing (do not climb above this depth)
+                 - require_all_components: for 2D/3D, all components must be close/backoff (default: True)
+                 - debug: verbose logging (default: False)
+             )doc")
+        .def("set_proximity_amplitude",
+             &MultiTaskPrevalenceGenerator::set_proximity_amplitude,
+             py::arg("source")=0, py::arg("prior_alpha")=1.0f, py::arg("gamma")=1.0f,
+             py::arg("cap_min")=0.10f, py::arg("cap_max")=1.00f, py::arg("apply_to_train_rows")=false,
+             R"doc(
+               Configure target-aware amplitude for NCM.
+                 - source: 0=OFF, 1=TRAIN_SHARE (downweight target-only keys), 2=TARGET_ONLY
+                 - prior_alpha: Laplace prior (default: 1.0)
+                 - gamma: sharpness exponent (default: 1.0)
+                 - cap_min: minimum amplitude clamp (default: 0.10)
+                 - cap_max: maximum amplitude clamp (default: 1.00)
+                 - apply_to_train_rows: whether to apply amplitude to training rows (default: False)
+             )doc")
+        .def("set_proximity_amp_components_policy",
+             &MultiTaskPrevalenceGenerator::set_proximity_amp_components_policy,
+             py::arg("first_component_only")=false,
+             R"doc(
+               Set component policy for 2D/3D amplitude computation.
+                 - first_component_only=False (default): Use MIN over all components (more conservative, recommended)
+                 - first_component_only=True: Use first component only (faster, backward compatible)
+             )doc")
+        .def("set_proximity_amp_distance_beta",
+             &MultiTaskPrevalenceGenerator::set_proximity_amp_distance_beta,
+             py::arg("dist_beta")=0.0f,
+             R"doc(
+               Set distance decay beta for amplitude.
+                 - dist_beta=0.0 (default): No distance decay
+                 - dist_beta>0: Apply decay factor (1/(1+d))^beta where d is hierarchy distance
+                 - Recommended values: 0.0 (off), 0.5 (mild), 1.0 (moderate)
+             )doc")
+        .def("set_statistical_backoff",
+             &MultiTaskPrevalenceGenerator::set_statistical_backoff,
+             py::arg("threshold") = 5,
+             py::arg("dmax") = 1,
+             py::arg("lambda") = 0.5,
+             R"doc(
+Enable statistical backoff: apply hierarchical backoff only when key count < threshold.
+        
+Parameters:
+    threshold : int, default=5
+        Minimum key count to use own prevalence. Keys with count < threshold will use backoff.
+    dmax : int, default=1
+        Maximum distance to climb for backoff.
+    lambda : float, default=0.5
+        Decay factor for backoff (applied as lambda^distance).
+        
+Examples:
+    >>> gen.set_statistical_backoff(threshold=5, dmax=1, lambda=0.5)
+    >>> gen.fit(smiles_train, labels_train)
+    >>> X = gen.transform(smiles_test)
+)doc")
         .def("__getstate__", &MultiTaskPrevalenceGenerator::__getstate__)
         .def("__setstate__", &MultiTaskPrevalenceGenerator::__setstate__);
+    
+    // --- Proximity mode enum ---
+    py::enum_<ProximityMode>(m, "ProximityMode")
+      .value("none",        ProximityMode::NONE)
+      .value("hier_mask",   ProximityMode::HIER_MASK)
+      .value("hier_backoff",ProximityMode::HIER_BACKOFF)
+      .export_values();
+    
+    // --- Convenience constants for NCM modes ---
+    m.attr("PROXIMITY_NONE")        = py::int_(static_cast<int>(ProximityMode::NONE));
+    m.attr("PROXIMITY_HIER_MASK")   = py::int_(static_cast<int>(ProximityMode::HIER_MASK));
+    m.attr("PROXIMITY_HIER_BACKOFF")= py::int_(static_cast<int>(ProximityMode::HIER_BACKOFF));
+    m.attr("NCM_MODE_MASK")         = py::int_(0);
+    m.attr("NCM_MODE_BACKOFF")      = py::int_(1);
+    
+    // --- Amplitude source constants ---
+    m.attr("PROXAMP_OFF")           = py::int_(static_cast<int>(PROXAMP_OFF));
+    m.attr("PROXAMP_TRAIN_SHARE")   = py::int_(static_cast<int>(PROXAMP_TRAIN_SHARE));
+    m.attr("PROXAMP_TARGET_ONLY")   = py::int_(static_cast<int>(PROXAMP_TARGET_ONLY));
 }
+#endif  // BOOST_PYTHON_BUILD

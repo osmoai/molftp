@@ -690,6 +690,145 @@ class MultiTaskPrevalenceGenerator:
         self.task_names_ = None
         self.n_features_ = None
     
+    def set_proximity_mode(self, mode: str):
+        """
+        Set Not-Close Masking (NCM) proximity mode.
+        
+        Parameters
+        ----------
+        mode : str
+            One of: 'none', 'hier_mask', 'hier_backoff'
+            - 'none': Disable NCM (default)
+            - 'hier_mask': Mask keys not close to training keys
+            - 'hier_backoff': Replace unseen keys with nearest training ancestor
+        """
+        self.generator.set_proximity_mode(mode)
+    
+    def set_proximity_params(self, dmax: int = 0, lambda_val: float = 0.5, train_only: bool = True):
+        """
+        Set Not-Close Masking (NCM) proximity parameters.
+        
+        Parameters
+        ----------
+        dmax : int, default=0
+            Maximum distance (0 reproduces Dummy-Masking behavior for unseen keys)
+        lambda_val : float, default=0.5
+            Decay factor for backoff (ignored for 'hier_mask')
+        train_only : bool, default=True
+            Must remain True to avoid leakage (keys are considered "seen" only if present in TRAIN)
+        """
+        self.generator.set_proximity_params(dmax, lambda_val, train_only)
+    
+    def set_notclose_masking(self, gap: int = 1, min_parent_depth: int = 0, 
+                            require_all_components: bool = True, debug: bool = False):
+        """
+        Configure Not-Close Masking (NCM) / hierarchical proximity parameters.
+        
+        Parameters
+        ----------
+        gap : int, default=1
+            Maximum distance (dmax) for hierarchical proximity
+        min_parent_depth : int, default=0
+            Minimum parent depth (do not climb above this depth)
+        require_all_components : bool, default=True
+            For 2D/3D: all components must be close/backoff
+        debug : bool, default=False
+            Enable debug output
+        """
+        self.generator.set_notclose_masking(gap, min_parent_depth, require_all_components, debug)
+    
+    def set_proximity_amplitude(self, source: int = 0, prior_alpha: float = 1.0, 
+                                gamma: float = 1.0, cap_min: float = 0.10, 
+                                cap_max: float = 1.00, apply_to_train_rows: bool = False):
+        """
+        Configure target-aware amplitude for NCM.
+        
+        Parameters
+        ----------
+        source : int, default=0
+            Amplitude source: 0=off, 1=train_share, 2=target_only
+        prior_alpha : float, default=1.0
+            Laplace prior alpha
+        gamma : float, default=1.0
+            Sharpness parameter
+        cap_min : float, default=0.10
+            Minimum amplitude cap
+        cap_max : float, default=1.00
+            Maximum amplitude cap
+        apply_to_train_rows : bool, default=False
+            Whether to apply amplitude to training rows
+        """
+        self.generator.set_proximity_amplitude(source, prior_alpha, gamma, cap_min, cap_max, apply_to_train_rows)
+    
+    def set_proximity_amp_components_policy(self, first_component_only: bool = False):
+        """
+        Set component policy for 2D/3D amplitude computation.
+        
+        Parameters
+        ----------
+        first_component_only : bool, default=False
+            If False (default): Use MIN over all components (more conservative, recommended)
+            If True: Use first component only (faster, backward compatible)
+        """
+        self.generator.set_proximity_amp_components_policy(first_component_only)
+    
+    def set_proximity_amp_distance_beta(self, dist_beta: float = 0.0):
+        """
+        Set distance decay beta for amplitude.
+        
+        Parameters
+        ----------
+        dist_beta : float, default=0.0
+            0.0 (default): No distance decay
+            >0: Apply decay factor (1/(1+d))^beta where d is hierarchy distance
+            Recommended values: 0.0 (off), 0.5 (mild), 1.0 (moderate)
+        """
+        self.generator.set_proximity_amp_distance_beta(dist_beta)
+    
+    def set_statistical_backoff(self, threshold: int = 5, dmax: int = 1, lambda_val: float = 0.5):
+        """
+        Enable statistical backoff: apply hierarchical backoff only when key count < threshold.
+        
+        This method applies hierarchical backoff only to rare keys (count < threshold),
+        while well-supported keys (count >= threshold) use their own prevalence.
+        
+        Parameters
+        ----------
+        threshold : int, default=5
+            Minimum key count to use own prevalence. Keys with count < threshold will use backoff.
+        dmax : int, default=1
+            Maximum distance to climb for backoff.
+        lambda_val : float, default=0.5
+            Decay factor for backoff (applied as lambda^distance).
+        
+        Examples
+        --------
+        >>> gen = MultiTaskPrevalenceGenerator(radius=6, method='key_loo')
+        >>> gen.set_statistical_backoff(threshold=5, dmax=1, lambda_val=0.5)
+        >>> gen.fit(smiles_train, labels_train)
+        >>> X = gen.transform(smiles_test)
+        """
+        self.generator.set_statistical_backoff(threshold, dmax, lambda_val)
+    
+    def set_verbose(self, verbose: bool):
+        """
+        Set verbose mode for debug messages.
+        
+        Parameters
+        ----------
+        verbose : bool
+            If True, enable debug messages from C++ backend.
+            If False, disable debug messages (default).
+        
+        Examples
+        --------
+        >>> gen = MultiTaskPrevalenceGenerator(radius=6, method='key_loo')
+        >>> gen.set_verbose(True)  # Enable debug messages
+        >>> gen.fit(smiles, labels)
+        >>> gen.set_verbose(False)  # Disable debug messages
+        """
+        self.generator.set_verbose(verbose)
+    
     def fit(self, 
             smiles: List[str], 
             labels: np.ndarray,
@@ -999,6 +1138,19 @@ class MultiTaskPrevalenceGenerator:
         print(f"✅ Features loaded from {filepath}")
         print(f"   Tasks: {gen.n_tasks_}, Features: {gen.n_features_}, Method: {gen.method}")
         return gen
+    
+    def get_n_tasks(self) -> int:
+        """
+        Get number of tasks.
+        
+        Returns
+        -------
+        int
+            Number of tasks
+        """
+        if not self.is_fitted_:
+            return 0
+        return self.generator.get_n_tasks()
     
     def get_n_features(self) -> int:
         """

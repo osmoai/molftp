@@ -10,6 +10,6 @@ Dummy-Masking: Build features with per-fold masking (requires train indices)
 
 from .prevalence import MultiTaskPrevalenceGenerator
 
-__version__ = "1.6.0"
+__version__ = "1.8.0"
 
 __all__ = ["MultiTaskPrevalenceGenerator"]

@@ -28,10 +28,17 @@
   - Test BAcc: **0.8252** (82.52%)
   - Test F1: **0.8193**
 
-**CRITICAL NOTE**: Values may vary slightly between runs due to:
+**CRITICAL FIX APPLIED**: The 84% BAcc was due to STATE LEAKAGE from running both splits in the same execution (`--split both`).
+
+**FIXED**: Removed `--split both` option. Now runs only ONE split at a time to prevent state leakage.
+
+**CORRECT VALUES** (from separate runs):
+- Random split: Key-LOO BAcc = 0.8234 (82.34%)
+- Scaffold split: Key-LOO BAcc = 0.8155 (81.55%) - from separate run
+
+**NOTE**: Values may vary slightly between runs due to:
 - XGBoost random seed not explicitly set (needs fix)
 - Non-deterministic behavior in model training
-- **User has seen ~84% BAcc before, so 83.80% is within expected range**
 
 ## Important Notes
 

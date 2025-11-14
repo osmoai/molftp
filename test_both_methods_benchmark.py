@@ -342,8 +342,8 @@ def main():
     """Test both methods and compare."""
     parser = argparse.ArgumentParser(description='MolFTP Benchmark')
     parser.add_argument('--json', action='store_true', help='Output results as JSON')
-    parser.add_argument('--split', choices=['random', 'scaffold', 'both'], default='both', 
-                       help='Split method: random, scaffold, or both (default: both)')
+    parser.add_argument('--split', choices=['random', 'scaffold'], default='random', 
+                       help='Split method: random or scaffold (default: random). Run separately and compare manually.')
     args = parser.parse_args()
     
     print("="*80)
@@ -353,16 +353,14 @@ def main():
     # Load data
     smiles, labels = load_biodegradation_data()
     
-    # Determine which splits to run
-    splits_to_run = []
-    if args.split in ['random', 'both']:
-        splits_to_run.append(('random', None))
-    if args.split in ['scaffold', 'both']:
-        splits_to_run.append(('scaffold', None))
+    # Run only ONE split at a time to avoid state leakage
+    # To compare: run separately with --split random and --split scaffold, then compare outputs
+    split_name = args.split
     
     all_results = {}
     
-    for split_name, _ in splits_to_run:
+    # Single split execution
+    if True:  # Single split
         print("\n" + "="*80)
         print(f"SPLIT METHOD: {split_name.upper()}")
         print("="*80)
@@ -498,33 +496,17 @@ def main():
             else:
                 print("✅ Test AUC seems reasonable for all methods")
     
-    # Compare Random vs Scaffold splits
-    if len(all_results) > 1 and 'random' in all_results and 'scaffold' in all_results:
-        print("\n" + "="*80)
-        print("COMPARISON: RANDOM vs SCAFFOLD SPLITS")
-        print("="*80)
-        
-        random_results = all_results['random']
-        scaffold_results = all_results['scaffold']
-        
-        for method_name in ['key_loo', 'dummy_masking']:
-            if random_results[method_name] and scaffold_results[method_name]:
-                r = random_results[method_name]
-                s = scaffold_results[method_name]
-                print(f"\n{method_name.upper()}:")
-                print(f"  {'Metric':<20} {'Random':<15} {'Scaffold':<15} {'Difference':<15}")
-                print(f"  {'-'*65}")
-                print(f"  {'Test AUC':<20} {r['auc_test']:<15.4f} {s['auc_test']:<15.4f} {s['auc_test'] - r['auc_test']:+.4f}")
-                print(f"  {'Test BAcc':<20} {r['bacc_test']:<15.4f} {s['bacc_test']:<15.4f} {s['bacc_test'] - r['bacc_test']:+.4f}")
-                print(f"  {'Test F1':<20} {r['f1_test']:<15.4f} {s['f1_test']:<15.4f} {s['f1_test'] - r['f1_test']:+.4f}")
+    # NOTE: To compare Random vs Scaffold splits, run separately:
+    #   python test_both_methods_benchmark.py --split random > random_results.txt
+    #   python test_both_methods_benchmark.py --split scaffold > scaffold_results.txt
+    # Then compare the outputs manually to avoid any state leakage between runs.
     
     # Output JSON if requested
     if args.json:
-        # For backward compatibility: if only random split, output old format
-        # Otherwise output new format with split names
-        if len(all_results) == 1 and 'random' in all_results:
+        # Output format: always single split (random or scaffold)
+        if split_name == 'random':
             # Old format (backward compatible with benchmark history)
-            split_results = all_results['random']
+            split_results = all_results[split_name]
             json_result = {}
             if split_results['key_loo']:
                 json_result['key_loo'] = {
@@ -584,66 +566,65 @@ def main():
             print(json.dumps(json_result, indent=2))
             print("BENCHMARK_JSON_END")
         else:
-            # New format (multiple splits)
-            json_results = {}
-            for split_name, split_results in all_results.items():
-                json_results[split_name] = {}
-                if split_results['key_loo']:
-                    json_results[split_name]['key_loo'] = {
-                        'auc_test': float(split_results['key_loo']['auc_test']),
-                        'auc_train': float(split_results['key_loo']['auc_train']),
-                        'bacc_test': float(split_results['key_loo']['bacc_test']),
-                        'bacc_train': float(split_results['key_loo']['bacc_train']),
-                        'f1_test': float(split_results['key_loo']['f1_test']),
-                        'f1_train': float(split_results['key_loo']['f1_train']),
-                        'fit_time': float(split_results['key_loo']['fit_time']),
-                        'transform_time': float(split_results['key_loo']['transform_time']),
-                        'train_time': float(split_results['key_loo']['train_time']),
-                        'confusion_matrix_test': split_results['key_loo']['cm_test'].tolist(),
-                    }
-                if split_results['dummy_masking']:
-                    json_results[split_name]['dummy_masking'] = {
-                        'auc_test': float(split_results['dummy_masking']['auc_test']),
-                        'auc_train': float(split_results['dummy_masking']['auc_train']),
-                        'bacc_test': float(split_results['dummy_masking']['bacc_test']),
-                        'bacc_train': float(split_results['dummy_masking']['bacc_train']),
-                        'f1_test': float(split_results['dummy_masking']['f1_test']),
-                        'f1_train': float(split_results['dummy_masking']['f1_train']),
-                        'fit_time': float(split_results['dummy_masking']['fit_time']),
-                        'transform_time': float(split_results['dummy_masking']['transform_time']),
-                        'train_time': float(split_results['dummy_masking']['train_time']),
-                        'confusion_matrix_test': split_results['dummy_masking']['cm_test'].tolist(),
-                    }
-                if split_results['ncm_backoff']:
-                    json_results[split_name]['ncm_backoff'] = {
-                        'auc_test': float(split_results['ncm_backoff']['auc_test']),
-                        'auc_train': float(split_results['ncm_backoff']['auc_train']),
-                        'bacc_test': float(split_results['ncm_backoff']['bacc_test']),
-                        'bacc_train': float(split_results['ncm_backoff']['bacc_train']),
-                        'f1_test': float(split_results['ncm_backoff']['f1_test']),
-                        'f1_train': float(split_results['ncm_backoff']['f1_train']),
-                        'fit_time': float(split_results['ncm_backoff']['fit_time']),
-                        'transform_time': float(split_results['ncm_backoff']['transform_time']),
-                        'train_time': float(split_results['ncm_backoff']['train_time']),
-                        'confusion_matrix_test': split_results['ncm_backoff']['cm_test'].tolist(),
-                    }
-                if split_results['ncm_backoff_amp']:
-                    json_results[split_name]['ncm_backoff_amp'] = {
-                        'auc_test': float(split_results['ncm_backoff_amp']['auc_test']),
-                        'auc_train': float(split_results['ncm_backoff_amp']['auc_train']),
-                        'bacc_test': float(split_results['ncm_backoff_amp']['bacc_test']),
-                        'bacc_train': float(split_results['ncm_backoff_amp']['bacc_train']),
-                        'f1_test': float(split_results['ncm_backoff_amp']['f1_test']),
-                        'f1_train': float(split_results['ncm_backoff_amp']['f1_train']),
-                        'fit_time': float(split_results['ncm_backoff_amp']['fit_time']),
-                        'transform_time': float(split_results['ncm_backoff_amp']['transform_time']),
-                        'train_time': float(split_results['ncm_backoff_amp']['train_time']),
-                        'confusion_matrix_test': split_results['ncm_backoff_amp']['cm_test'].tolist(),
-                    }
-                json_results[split_name]['dataset'] = split_results['dataset']
+            # Scaffold split format (same structure, different split name)
+            split_results = all_results[split_name]
+            json_result = {}
+            if split_results['key_loo']:
+                json_result['key_loo'] = {
+                    'auc_test': float(split_results['key_loo']['auc_test']),
+                    'auc_train': float(split_results['key_loo']['auc_train']),
+                    'bacc_test': float(split_results['key_loo']['bacc_test']),
+                    'bacc_train': float(split_results['key_loo']['bacc_train']),
+                    'f1_test': float(split_results['key_loo']['f1_test']),
+                    'f1_train': float(split_results['key_loo']['f1_train']),
+                    'fit_time': float(split_results['key_loo']['fit_time']),
+                    'transform_time': float(split_results['key_loo']['transform_time']),
+                    'train_time': float(split_results['key_loo']['train_time']),
+                    'confusion_matrix_test': split_results['key_loo']['cm_test'].tolist(),
+                }
+            if split_results['dummy_masking']:
+                json_result['dummy_masking'] = {
+                    'auc_test': float(split_results['dummy_masking']['auc_test']),
+                    'auc_train': float(split_results['dummy_masking']['auc_train']),
+                    'bacc_test': float(split_results['dummy_masking']['bacc_test']),
+                    'bacc_train': float(split_results['dummy_masking']['bacc_train']),
+                    'f1_test': float(split_results['dummy_masking']['f1_test']),
+                    'f1_train': float(split_results['dummy_masking']['f1_train']),
+                    'fit_time': float(split_results['dummy_masking']['fit_time']),
+                    'transform_time': float(split_results['dummy_masking']['transform_time']),
+                    'train_time': float(split_results['dummy_masking']['train_time']),
+                    'confusion_matrix_test': split_results['dummy_masking']['cm_test'].tolist(),
+                }
+            if split_results['ncm_backoff']:
+                json_result['ncm_backoff'] = {
+                    'auc_test': float(split_results['ncm_backoff']['auc_test']),
+                    'auc_train': float(split_results['ncm_backoff']['auc_train']),
+                    'bacc_test': float(split_results['ncm_backoff']['bacc_test']),
+                    'bacc_train': float(split_results['ncm_backoff']['bacc_train']),
+                    'f1_test': float(split_results['ncm_backoff']['f1_test']),
+                    'f1_train': float(split_results['ncm_backoff']['f1_train']),
+                    'fit_time': float(split_results['ncm_backoff']['fit_time']),
+                    'transform_time': float(split_results['ncm_backoff']['transform_time']),
+                    'train_time': float(split_results['ncm_backoff']['train_time']),
+                    'confusion_matrix_test': split_results['ncm_backoff']['cm_test'].tolist(),
+                }
+            if split_results['ncm_backoff_amp']:
+                json_result['ncm_backoff_amp'] = {
+                    'auc_test': float(split_results['ncm_backoff_amp']['auc_test']),
+                    'auc_train': float(split_results['ncm_backoff_amp']['auc_train']),
+                    'bacc_test': float(split_results['ncm_backoff_amp']['bacc_test']),
+                    'bacc_train': float(split_results['ncm_backoff_amp']['bacc_train']),
+                    'f1_test': float(split_results['ncm_backoff_amp']['f1_test']),
+                    'f1_train': float(split_results['ncm_backoff_amp']['f1_train']),
+                    'fit_time': float(split_results['ncm_backoff_amp']['fit_time']),
+                    'transform_time': float(split_results['ncm_backoff_amp']['transform_time']),
+                    'train_time': float(split_results['ncm_backoff_amp']['train_time']),
+                    'confusion_matrix_test': split_results['ncm_backoff_amp']['cm_test'].tolist(),
+                }
+            json_result['dataset'] = split_results['dataset']
             
             print("\nBENCHMARK_JSON_START")
-            print(json.dumps(json_results, indent=2))
+            print(json.dumps(json_result, indent=2))
             print("BENCHMARK_JSON_END")
 
 if __name__ == "__main__":

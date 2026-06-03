@@ -841,15 +841,32 @@ class MultiTaskPrevalenceGenerator:
                 return self.generator.transform(smiles)
         
         elif self.method == 'dummy_masking':
-            # Dummy-Masking: Requires train indices for masking
+            # Out-of-sample INFERENCE: no train_indices_per_task -> use the frozen
+            # fitted prevalence. Keys never seen in training are simply absent from the
+            # prevalence maps and therefore contribute 0 (i.e. they are masked) — that
+            # IS dummy-masking at inference, with no batch-relative indices required.
+            #
+            # The train_indices path below indexes INTO `smiles` and only makes sense
+            # for IN-SAMPLE CV masking (batch == the fitted set). Using it on a held-out
+            # batch re-derives the "train keys" from the wrong rows — silently collapsing
+            # the features (and indexing out of bounds for a smaller/new batch). That was
+            # the inference-collapse bug.
             if train_indices_per_task is None:
-                raise ValueError("Dummy-Masking requires train_indices_per_task. "
-                               "Provide a list of training indices for each task.")
-            
+                return self.generator.transform(smiles)
+
             if len(train_indices_per_task) != self.n_tasks_:
                 raise ValueError(f"train_indices_per_task must have {self.n_tasks_} elements (one per task), "
                                f"got {len(train_indices_per_task)}")
-            
+            # These indices address rows of THIS `smiles` batch (not the fitted set).
+            # Fail loudly on out-of-range indices instead of collapsing silently.
+            n = len(smiles)
+            for t_idx, ti in enumerate(train_indices_per_task):
+                if len(ti) and (min(ti) < 0 or max(ti) >= n):
+                    raise ValueError(
+                        f"train_indices_per_task[{t_idx}] references rows outside the transform "
+                        f"batch (n={n}). dummy_masking train indices address `smiles` rows, not the "
+                        f"training set. For out-of-sample inference call transform(smiles) WITHOUT "
+                        f"train_indices_per_task.")
             return self.generator.transform_with_dummy_masking(smiles, train_indices_per_task)
         
         else:

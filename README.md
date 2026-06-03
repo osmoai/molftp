@@ -96,6 +96,23 @@ print(f"Multi-task features shape: {features.shape}")
 # Features shape: (3, 81)  # 27 features per task × 3 tasks
 ```
 
+### End-to-end prediction (`SMILES → label`)
+
+The API is split into an **inference** layer (features) and a **predict** layer (labels):
+
+```python
+from molftp.predict import MolFTPClassifier
+
+clf = MolFTPClassifier(radius=6, method='key_loo', k_threshold=2).fit(train_smiles, y_train)
+labels = clf.predict(test_smiles)
+proba  = clf.predict_proba(test_smiles)[:, 1]
+X      = clf.transform(test_smiles)     # inference only: features, no prediction
+```
+
+`MolFTPClassifier` composes a molFTP feature generator with any scikit-learn estimator
+(`estimator=`, default `LogisticRegression`). See **[docs/api.md](docs/api.md)** for the full API,
+the inference/predict separation, parameter semantics (incl. `k_threshold`), and method notes.
+
 ## Examples
 
 See the `examples/` directory for comprehensive examples:
@@ -109,8 +126,8 @@ See the `examples/` directory for comprehensive examples:
 
 ### Key-LOO (Key Leave-One-Out)
 
-- Filters keys appearing in <= k molecules (default k=2)
-- Applies rescaling factor: `(n - k) / n` for better extrapolation
+- Filters rare keys: keeps a key only if its per-molecule **and** total counts are `>= k_threshold` (default 2)
+- `k_threshold` is passed through to the C++ core and genuinely changes the features (see [docs/api.md](docs/api.md))
 - Best for: Final model training, prediction on new molecules
 - Features are **task-independent** (can be pre-computed once)
 

@@ -8,10 +8,12 @@ MultiTaskPrevalenceGenerator = molftp.MultiTaskPrevalenceGenerator
 
 
 def test_pickle_round_trip(mtpg, smiles):
-    # State round-trip through __getstate__/__setstate__ preserves transform
-    state = mtpg.__getstate__()
-    mtpg2 = MultiTaskPrevalenceGenerator()  # defaults; __setstate__ will overwrite
-    mtpg2.__setstate__(state)
+    # Round-trip the fitted generator through real pickle (dumps/loads): the reconstructed
+    # object must come back fitted and produce identical features. This exercises the same
+    # py::pickle path used by save_features()/load_features().
+    blob = pickle.dumps(mtpg)
+    mtpg2 = pickle.loads(blob)
+    assert mtpg2.is_fitted(), "unpickled generator should be fitted"
 
     X1 = mtpg.transform(smiles)
     X2 = mtpg2.transform(smiles)

@@ -61,9 +61,8 @@ def mtpg(radius, Y_sparse, smiles, task_names):
         stat_3d="exact_binom",
         alpha=0.5,
         num_threads=0,
-        method='key_loo',  # Use method='key_loo' for Key-LOO
-        k_threshold=1,
-        loo_smoothing_tau=1.0,
+        k_threshold=1,      # real C++ parameter: keep all keys (no rare-key filtering)
+        use_key_loo=True,   # Key-LOO path (C++ uses the boolean flag, not method=...)
     )
     mtpg.fit(smiles, Y_sparse, task_names)
     return mtpg

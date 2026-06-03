@@ -667,9 +667,18 @@ class MultiTaskPrevalenceGenerator:
         
         use_key_loo = (method == 'key_loo')
         
-        # Initialize C++ multi-task generator
-        # Note: k_threshold and loo_smoothing_tau are stored in Python but NOT passed to C++
-        # C++ uses default k_threshold=2 internally
+        # Initialize C++ multi-task generator.
+        # k_threshold is passed through to the C++ core, where it filters out keys whose
+        # per-molecule AND total occurrence counts are < k_threshold (see the parameter
+        # docstring). loo_smoothing_tau is retained on the Python object (for save/load and
+        # API stability) but is NOT yet applied by the C++ core; setting it to a non-default
+        # value emits a warning rather than silently doing nothing.
+        if not float(self.loo_smoothing_tau) == 1.0:
+            warnings.warn(
+                "loo_smoothing_tau != 1.0 is not yet implemented in the C++ core and has no "
+                "effect on the computed features. It is stored for forward-compatibility only.",
+                RuntimeWarning, stacklevel=2,
+            )
         self.generator = ftp.MultiTaskPrevalenceGenerator(
             radius=self.radius,
             nBits=self.nBits,
@@ -680,6 +689,7 @@ class MultiTaskPrevalenceGenerator:
             alpha=self.alpha,
             num_threads=self.num_threads if self.num_threads > 0 else 0,  # C++ uses 0 for auto
             counting_method=self.counting_method,
+            k_threshold=self.k_threshold,
             use_key_loo=use_key_loo,
             verbose=False  # Disable verbose by default
         )

@@ -139,3 +139,9 @@ never its magnitude. Two consequences worth knowing:
 If you want the LOO magnitude correction to actually influence the model, the aggregation in
 `build_3view_vectors_batch` would need to be made magnitude-aware (e.g. summing/maxing *signed*
 prevalence instead of counting signs) — a deliberate change that would shift all downstream results.
+
+> **Note (paper ↔ code):** the paper (arXiv:2510.06029, eq. 5) defines the *margin* feature as
+> `max(positive) − min(negative)` — magnitude-based — whereas the default `"max"` code path computes
+> a sign-count for it. The paper's own Figure 6 confirms the rescale is inert on the proportion
+> features. See [research-notes.md](research-notes.md) for the full analysis and the (a/b/c) decision,
+> which needs re-benchmarking before adopting the magnitude margin.

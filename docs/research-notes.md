@@ -65,19 +65,42 @@ Cannot conclude without re-benchmarking: the paper's headline numbers (Table 2 �
 sign-count code**. Switching `V0/V1` to the magnitude margin changes the features, so it must be
 validated against those numbers.
 
-### Proposed experiment
-1. On a branch, implement the paper-faithful magnitude margin for `V0`/`V1`
-   (`max(prevalence > 0) − min(prevalence < 0)`, plus its normalized relative margin); keep
-   `net_0..net_R` as proportions.
-2. Re-run BBBP 10-fold CV (LogReg, RandomForest, XGBoost) at `R=6`, `sim_thresh=0.5`, both key-LOO
-   and dummy-masking; compare to Table 2 (target ≈ AUROC 0.905 / AUPRC 0.949) and to the current
-   sign-count code on the same splits.
-3. Decide:
-   - magnitude-margin **matches or beats** sign-count → adopt **(c)**, keep the LOO rescale (now
-     meaningful), and the paper and code agree;
-   - magnitude-margin **underperforms** → the sign-count code is the de-facto method: either **(a)**
-     keep and correct the paper text to describe sign-counts, or **(b)** delete the inert rescale.
+### Experiment — DONE (the margin is now a configurable option)
 
-Until then: the code is documented as sign-count (`docs/api.md`), and the rescale/`tau` are marked
-inert with a passing characterization test
-(`tests/test_kloo_core.py::test_positive_rescale_is_inert_for_sign_count_features`).
+An isolated magnitude-margin build (`max(+) − min(−)` for `V0/V1`, `net_d` unchanged) was compared
+head-to-head against the sign-count build on identical seeded folds: 5-fold CV, `R=6`,
+`sim_thresh=0.5`, key-LOO, `k_threshold=2`. Three feature modes (**ratio** = sign-count,
+**magnitude**, **concat** = `[ratio | magnitude]`) × three models (LogReg, RandomForest, and the
+**mlxTM** Tsetlin Machine on thermometer-binarized features). AUROC:
+
+| dataset | model | ratio | magnitude | concat |
+|---|---|---|---|---|
+| BBBP | LR | 0.8994 | **0.9059** | 0.9025 |
+| BBBP | RF | 0.9019 | **0.9078** | 0.9070 |
+| BBBP | mlxTM | 0.8942 | 0.8926 | **0.8946** |
+| MDR1 | LR | 0.9576 | **0.9680** | 0.9657 |
+| MDR1 | RF | 0.9589 | 0.9626 | **0.9661** |
+| MDR1 | mlxTM | 0.9630 | **0.9669** | 0.9666 |
+| MOR | LR | 0.9149 | **0.9170** | 0.9157 |
+| MOR | RF | 0.9360 | **0.9366** | 0.9352 |
+
+The sign-count numbers reproduce the paper's Table 2 (BBBP RF 0.902 vs paper key-LOO 0.8995 /
+XGB 0.9053), validating the harness.
+
+**Findings.** `magnitude ≥ concat ≥ ratio` for LR/RF in almost every cell — magnitude is best or
+tied-best in 6/8 LR+RF configs; concat sits between (it rarely beats magnitude alone, occasionally
+edges it on RF/AUPRC). The mlxTM is essentially mode-agnostic (thermometer binarization discards the
+margin magnitude). Gains are small (~+0.005–0.01 AUROC) and within fold-std, but the **direction is
+consistent** and matches the paper's robustness claim (Fig. 3).
+
+**Decision — implemented as an option, not a breaking change.** `MultiTaskPrevalenceGenerator` and
+`MolFTPClassifier` now accept `margin_mode`:
+- `'signcount'` (**default**, backward-compatible, reproduces the published numbers);
+- `'magnitude'` (paper eq. 5; the small, consistent best for LR/RF — recommended when matching the
+  paper or squeezing accuracy);
+- `'both'` (concatenate ratio + magnitude, `+2` features/view).
+
+This makes the paper-faithful margin available (so the LOO rescale is meaningful under `'magnitude'`)
+while keeping the de-facto sign-count behaviour as the default. The `(k_j−1)/k_j` rescale / `tau`
+remain inert under the default `'signcount'`; under `'magnitude'` they would scale the margin, so a
+follow-up could wire the LOO rescale to bite there. Coverage: `tests/test_kloo_core.py::test_margin_mode_option`.

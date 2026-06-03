@@ -631,8 +631,9 @@ class MultiTaskPrevalenceGenerator:
                  num_threads: int = -1,
                  counting_method: str = 'counting',
                  k_threshold: int = 2,
-                 loo_smoothing_tau: float = 1.0):
-        
+                 loo_smoothing_tau: float = 1.0,
+                 margin_mode: str = 'signcount'):
+
         self.radius = radius
         self.method = method
         self.stat_1d = stat_1d
@@ -660,7 +661,18 @@ class MultiTaskPrevalenceGenerator:
         self.counting_method = counting_map[self.counting_method_name]
         self.k_threshold = k_threshold
         self.loo_smoothing_tau = loo_smoothing_tau
-        
+
+        # Margin aggregation mode for the V[0]/V[1] features (see docs/api.md + research-notes.md):
+        #   'signcount' (default, back-compat): net (pos - neg) atom count
+        #   'magnitude' (paper eq.5): max(positive) - min(negative) atom-localized score
+        #   'both': concatenate signcount + magnitude (adds 2 features per view)
+        margin_map = {'signcount': 0, 'magnitude': 1, 'both': 2}
+        if margin_mode not in margin_map:
+            raise ValueError(f"Invalid margin_mode: {margin_mode}. Must be one of {list(margin_map)}")
+        self.margin_mode = margin_mode
+        self._margin_mode_int = margin_map[margin_mode]
+
+
         # Determine use_key_loo flag based on method
         if method not in ['key_loo', 'dummy_masking']:
             raise ValueError(f"Invalid method: {method}. Must be 'key_loo' or 'dummy_masking'")
@@ -694,7 +706,8 @@ class MultiTaskPrevalenceGenerator:
             counting_method=self.counting_method,
             k_threshold=self.k_threshold,
             use_key_loo=use_key_loo,
-            verbose=False  # Disable verbose by default
+            verbose=False,  # Disable verbose by default
+            margin_mode=self._margin_mode_int,
         )
         
         # State tracking
@@ -956,6 +969,7 @@ class MultiTaskPrevalenceGenerator:
             'counting_method_name': self.counting_method_name,
             'k_threshold': self.k_threshold,  # NEW: Include k_threshold in saved state
             'loo_smoothing_tau': self.loo_smoothing_tau,  # NEW: Include loo_smoothing_tau in saved state
+            'margin_mode': self.margin_mode,  # signcount / magnitude / both
         }
         
         try:
@@ -1017,6 +1031,7 @@ class MultiTaskPrevalenceGenerator:
             counting_method=state.get('counting_method_name', 'counting'),
             k_threshold=state.get('k_threshold', 2),  # NEW: Restore k_threshold (default=2 filters singletons)
             loo_smoothing_tau=state.get('loo_smoothing_tau', 1.0),  # NEW: Restore loo_smoothing_tau (default=1.0 for backward compatibility)
+            margin_mode=state.get('margin_mode', 'signcount'),  # back-compat: old saves -> signcount
         )
         
         # Restore C++ generator and fitted state

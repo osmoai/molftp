@@ -80,6 +80,33 @@ def test_2d_features_are_nonzero(radius):
     assert nonzero_ratio_2d > 0.05, f"2D view looks empty (ratio={nonzero_ratio_2d:.3f})"
 
 
+def test_margin_mode_option(radius):
+    # margin_mode selects the V[0]/V[1] aggregation: 'signcount' (default), 'magnitude' (paper
+    # eq.5), 'both' (concat -> +2 features/view). Verify dims, the default, and that magnitude
+    # actually changes the features.
+    from molftp.prevalence import MultiTaskPrevalenceGenerator as PG
+    smi = ['CCO', 'CCCO', 'CCCCO', 'CCN', 'CCCN', 'c1ccccc1', 'c1ccccc1C', 'CC(=O)O', 'CCCl', 'CCBr']
+    y = np.array([i % 2 for i in range(len(smi))], dtype=float).reshape(-1, 1)
+
+    def feats(mode=None):
+        kw = {} if mode is None else {"margin_mode": mode}
+        g = PG(radius=radius, method='key_loo', **kw)
+        g.fit(smi, y, ['t'])
+        return np.asarray(g.transform(smi))
+
+    per_view = 2 + radius + 1
+    Xdefault, Xs, Xm, Xb = feats(), feats('signcount'), feats('magnitude'), feats('both')
+    assert Xs.shape[1] == 3 * per_view
+    assert Xm.shape[1] == 3 * per_view
+    assert Xb.shape[1] == 3 * (per_view + 2)            # 'both' adds 2 margin cols per view
+    np.testing.assert_allclose(Xdefault, Xs, atol=1e-10)  # signcount is the default
+    assert not np.allclose(Xs, Xm), "magnitude margin should differ from signcount"
+    # 'both' must contain the signcount margin in its first two columns of view 1
+    np.testing.assert_allclose(Xb[:, 0:2], Xs[:, 0:2], atol=1e-10)
+    with pytest.raises(ValueError):
+        PG(margin_mode='nope')
+
+
 def test_2d_keys_are_subset_of_1d(vecgen: VectorizedFTPGenerator, smiles, labels, radius):
     # 1D prevalence keys
     prev1 = vecgen.build_1d_ftp_stats(smiles, labels.tolist(), radius, "chi2", 0.5)

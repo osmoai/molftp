@@ -110,6 +110,7 @@ X      = clf.transform(test_smiles)        # inference only (features), no predi
 | `stat_1d` / `stat_2d` / `stat_3d` | `chi2` / `mcnemar_midp` / `exact_binom` | Significance test per view. |
 | `alpha` | 0.5 | Additive smoothing on contingency cells. |
 | `num_threads` | -1 | `-1` = all cores, `0` = auto, `>0` = fixed. |
+| `margin_mode` | `signcount` | Aggregation for the per-view `V[0]/V[1]` margin features. `signcount` (default, back-compat): net `(pos − neg)` atom count. `magnitude` (paper eq. 5): `max(+) − min(−)` of the atom-localized scores — small, consistent accuracy edge for LR/RF (see [research-notes.md](research-notes.md)). `both`: concatenate the two (`+2` features per view). |
 
 ### Notes on `k_threshold`
 

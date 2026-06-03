@@ -2,7 +2,8 @@
 
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 [![Python 3.8+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![C++17](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
+[![C++20](https://img.shields.io/badge/C++-20-blue.svg)](https://isocpp.org/)
+[![RDKit 2026.03](https://img.shields.io/badge/RDKit-2026.03-green.svg)](https://www.rdkit.org/)
 
 High-performance molecular feature generation based on fragment-target prevalence statistics. MolFTP generates interpretable, statistically-grounded features for molecular property prediction with state-of-the-art performance.
 
@@ -26,37 +27,34 @@ High-performance molecular feature generation based on fragment-target prevalenc
 
 ### Requirements
 
-- Python >= 3.11
-- RDKit >= 2025.3.0
-- NumPy >= 1.19.0
-- C++17 compatible compiler
+- Python >= 3.9
+- RDKit (latest tested: **2026.03**; 2022.03+ expected to work)
+- A **C++20** compiler (clang on macOS, gcc/clang on Linux) — RDKit 2026.03 headers use C++20
+- NumPy, pandas, scikit-learn
 
-### Install from source
+MolFTP has a C++ core that links against RDKit's **C++ headers and libraries**. The plain
+`pip install rdkit` wheel is runtime-only and cannot build it — you need the conda-forge dev
+packages (`librdkit-dev` + `libboost-devel`). `environment.yml` sets all of this up in one step.
+
+### Install from source (recommended)
 
 ```bash
-# Clone the repository
 git clone https://github.com/osmoai/molftp.git
 cd molftp
 
-# Create and activate conda environment with build tools
-mamba create -n rdkit_dev cmake librdkit-dev eigen libboost-devel compilers
-conda activate rdkit_dev
+# One command — RDKit 2026.03 + C++ headers (librdkit-dev) + Boost (libboost-devel) + toolchain
+conda env create -f environment.yml      # or: mamba env create -f environment.yml
+conda activate molftp
 
-# Install Python dependencies
-conda install -c conda-forge numpy pandas scikit-learn
-conda install -c conda-forge rdkit
+# Build + install (editable). setup.py auto-detects RDKit from the active env.
+pip install -e .
 
-# Build and install
-python setup.py install
+# Verify
+python -c "import molftp; print('molftp', molftp.__version__, 'OK')"
 ```
 
-**Note**: Use `mamba` for faster dependency resolution, or replace with `conda` if mamba is not installed.
-
-### Quick install with pip (coming soon)
-
-```bash
-pip install molftp
-```
+See **[BUILD.md](BUILD.md)** for build internals, a custom-RDKit (`RDKIT_PREFIX`) path, and
+troubleshooting.
 
 ## Quick Start
 

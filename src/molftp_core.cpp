@@ -59,7 +59,8 @@ private:
     int max_pairs;
     int max_triplets;
     CountingMethod counting_method;
-    
+    int margin_mode_ = 0;  // V[0]/V[1] margin: 0=signcount (default, back-compat), 1=magnitude, 2=both
+
     // ---------- Phase 2: Fingerprint caching ----------
     struct FPView {
         vector<int> on;  // on-bits
@@ -445,9 +446,15 @@ public:
     VectorizedFTPGenerator(int nBits = 2048, double sim_thresh = 0.85, 
                                int max_pairs = 1000, int max_triplets = 1000,
                                CountingMethod counting_method = CountingMethod::COUNTING) 
-        : nBits(nBits), sim_thresh(sim_thresh), max_pairs(max_pairs), max_triplets(max_triplets), 
+        : nBits(nBits), sim_thresh(sim_thresh), max_pairs(max_pairs), max_triplets(max_triplets),
           counting_method(counting_method) {}
-    
+
+    // Margin aggregation mode for build_3view_vectors_batch V[0]/V[1]:
+    // 0 = signcount (net pos-neg count, default), 1 = magnitude (max(+)-min(-), paper eq.5),
+    // 2 = both (signcount AND magnitude concatenated -> 2 extra columns per view).
+    void set_margin_mode(int m) { margin_mode_ = m; }
+    int  get_margin_mode() const { return margin_mode_; }
+
     // Precompute all fingerprints at once (like Python) - return as void* to avoid pybind11 issues
     // Note: for similarity we use folded ExplicitBitVect (nBits), which is fast and compact.
     // For motif keys we separately use count-based Morgan getFingerprint + BitInfoMap (unfolded) to
@@ -916,8 +923,11 @@ public:
                 double z = fabs(log2OR) / (sqrt(var) / log(2.0));
                 double p = erfc(std::max(0.0, z - 0.5) / sqrt(2.0));
                 score = (log2OR >= 0 ? 1.0 : -1.0) * (-log10(std::max(p, 1e-300)));
-            } else if (test_kind == "chisq") {
-                // Pearson chi-square with 1 df
+            } else if (test_kind == "chisq" || test_kind == "chi2") {
+                // Pearson chi-square with 1 df. NOTE: "chi2" MUST be handled here to match
+                // build_1d_ftp_stats_threaded (which aliases "chi2" -> chi-square). Without
+                // this alias, "chi2" fell through to the legacy Fisher/Woolf branch below,
+                // making the sequential and threaded paths compute different statistics.
                 double num = (ap*dp - bp*cp);
                 double chi2 = (num*num) * N / std::max(1e-12, (ap+bp)*(cp+dp)*(ap+cp)*(bp+dp));
                 double p = erfc(sqrt(std::max(chi2, 0.0)) / sqrt(2.0));
@@ -2575,7 +2585,8 @@ public:
         }
         
         // Fast path for "max" aggregation (inline processing)
-        const int cols = 2 + (radius + 1);
+        const int margin_feats = (margin_mode_ == 2) ? 4 : 2;  // 'both' emits signcount + magnitude
+        const int cols = margin_feats + (radius + 1);
         
         // Pre-allocate all vectors with exact size
         vector<vector<double>> V1(n_molecules, vector<double>(cols, 0.0));
@@ -2717,26 +2728,36 @@ public:
                 // NUCLEAR-fast: Inline vectorized margin computation for all views
                 double denom = static_cast<double>(n_atoms);
                 
-                // Compute all margins in single pass
-                int p1 = 0, n1 = 0, p2 = 0, n2 = 0, p3 = 0, n3 = 0;
+                // Compute signcount (net pos-neg) AND magnitude (max(+)-min(-)) margins in one pass.
+                int p1=0,n1=0, p2=0,n2=0, p3=0,n3=0;
+                double mxp1=0,mnn1=0, mxp2=0,mnn2=0, mxp3=0,mnn3=0;
                 for (int j = 0; j < n_atoms; ++j) {
                     double v1 = prevalence_1d[j];
                     double v2 = prevalence_2d[j];
                     double v3 = prevalence_3d[j];
-                    p1 += (v1 >= atom_gate) ? 1 : 0;
-                    n1 += (v1 <= -atom_gate) ? 1 : 0;
-                    p2 += (v2 >= atom_gate) ? 1 : 0;
-                    n2 += (v2 <= -atom_gate) ? 1 : 0;
-                    p3 += (v3 >= atom_gate) ? 1 : 0;
-                    n3 += (v3 <= -atom_gate) ? 1 : 0;
+                    p1 += (v1 >= atom_gate) ? 1 : 0; n1 += (v1 <= -atom_gate) ? 1 : 0;
+                    p2 += (v2 >= atom_gate) ? 1 : 0; n2 += (v2 <= -atom_gate) ? 1 : 0;
+                    p3 += (v3 >= atom_gate) ? 1 : 0; n3 += (v3 <= -atom_gate) ? 1 : 0;
+                    if (v1 > mxp1) mxp1=v1; if (v1 < mnn1) mnn1=v1;
+                    if (v2 > mxp2) mxp2=v2; if (v2 < mnn2) mnn2=v2;
+                    if (v3 > mxp3) mxp3=v3; if (v3 < mnn3) mnn3=v3;
                 }
                 
-                V1[i][0] = static_cast<double>(p1 - n1);
-                V1[i][1] = V1[i][0] / denom;
-                V2[i][0] = static_cast<double>(p2 - n2);
-                V2[i][1] = V2[i][0] / denom;
-                V3[i][0] = static_cast<double>(p3 - n3);
-                V3[i][1] = V3[i][0] / denom;
+                double sc1=p1-n1, sc2=p2-n2, sc3=p3-n3;
+                double mg1=mxp1-mnn1, mg2=mxp2-mnn2, mg3=mxp3-mnn3;
+                if (margin_mode_ == 1) {            // magnitude only (paper eq.5)
+                    V1[i][0]=mg1; V1[i][1]=mg1/denom;
+                    V2[i][0]=mg2; V2[i][1]=mg2/denom;
+                    V3[i][0]=mg3; V3[i][1]=mg3/denom;
+                } else if (margin_mode_ == 2) {     // both: [signcount, magnitude]
+                    V1[i][0]=sc1; V1[i][1]=sc1/denom; V1[i][2]=mg1; V1[i][3]=mg1/denom;
+                    V2[i][0]=sc2; V2[i][1]=sc2/denom; V2[i][2]=mg2; V2[i][3]=mg2/denom;
+                    V3[i][0]=sc3; V3[i][1]=sc3/denom; V3[i][2]=mg3; V3[i][3]=mg3/denom;
+                } else {                            // 0 = signcount (default)
+                    V1[i][0]=sc1; V1[i][1]=sc1/denom;
+                    V2[i][0]=sc2; V2[i][1]=sc2/denom;
+                    V3[i][0]=sc3; V3[i][1]=sc3/denom;
+                }
                 
                 // NUCLEAR-fast: Inline per-depth net computation for all views
                 for (int d = 0; d <= radius; ++d) {
@@ -2752,9 +2773,9 @@ public:
                         pos3 += (v3 >= atom_gate) ? 1 : 0;
                         neg3 += (v3 <= -atom_gate) ? 1 : 0;
                     }
-                    V1[i][2 + d] = static_cast<double>(pos1 - neg1) / denom;
-                    V2[i][2 + d] = static_cast<double>(pos2 - neg2) / denom;
-                    V3[i][2 + d] = static_cast<double>(pos3 - neg3) / denom;
+                    V1[i][margin_feats + d] = static_cast<double>(pos1 - neg1) / denom;
+                    V2[i][margin_feats + d] = static_cast<double>(pos2 - neg2) / denom;
+                    V3[i][margin_feats + d] = static_cast<double>(pos3 - neg3) / denom;
                 }
 
                 // Cleanup
@@ -3693,8 +3714,16 @@ public:
                     if (Ts >= sim_thresh_local) cands.push_back({pos, Ts});
                 }
                 if (cands.empty()) continue;
+                // Deterministic, legacy-matching tie-break: higher T first; on equal T, lower
+                // original FAIL index first (== legacy's strict-'>' lowest-position choice).
+                // std::partial_sort is NOT stable, so without this explicit tie-break,
+                // equal-Tanimoto candidates (common: linear chains share radius-2 Morgan FPs)
+                // would be ordered by libc++ internals and diverge from the legacy scan.
                 partial_sort(cands.begin(), cands.begin()+min<int>(8,cands.size()), cands.end(),
-                              [](const Cand& x, const Cand& y){ return x.T > y.T; });
+                              [&](const Cand& x, const Cand& y){
+                                  if (x.T != y.T) return x.T > y.T;
+                                  return ixF.pos2idx[x.pos] < ixF.pos2idx[y.pos];
+                              });
                 int keep_j=-1; double keep_T=-1.0;
                 for (size_t h=0; h<cands.size() && h<8; ++h) {
                     int pos = cands[h].pos;
@@ -4402,14 +4431,15 @@ private:
     int k_threshold_;  // Key-LOO threshold (default: 2, matching Python)
     bool use_key_loo_;  // NEW: Enable/disable Key-LOO filtering (true=Key-LOO, false=Dummy-Masking)
     bool verbose_;  // NEW: Enable/disable verbose output
-    
+    int margin_mode_ = 0;  // V[0]/V[1] margin: 0=signcount, 1=magnitude, 2=both (propagated to task generators)
+
     bool is_fitted_;
-    
+
     // Helper to compute features per task dynamically
-    // Formula: 3 views (1D, 2D, 3D) × (2 + radius + 1) features per view
-    // For radius=6: 3 × 9 = 27 features per task
+    // 3 views (1D, 2D, 3D) × (margin_feats + radius + 1); margin_feats = 4 for 'both', else 2.
     int get_features_per_task() const {
-        int features_per_view = 2 + radius_ + 1;  // e.g., 2 + 6 + 1 = 9 for radius=6
+        int margin_feats = (margin_mode_ == 2) ? 4 : 2;
+        int features_per_view = margin_feats + radius_ + 1;
         return 3 * features_per_view;  // 3 views (1D, 2D, 3D)
     }
     
@@ -4424,12 +4454,14 @@ public:
         double alpha = 0.5,
         int num_threads = 0,
         CountingMethod counting_method = CountingMethod::COUNTING,
+        int k_threshold = 2,  // Key-LOO threshold: keep a key iff its molecule- AND total-count >= k_threshold
         bool use_key_loo = true,  // NEW: Enable/disable Key-LOO filtering
-        bool verbose = true  // NEW: Enable/disable verbose output
+        bool verbose = true,  // NEW: Enable/disable verbose output
+        int margin_mode = 0  // V[0]/V[1] margin: 0=signcount (default), 1=magnitude (paper eq.5), 2=both
     ) : radius_(radius), nBits_(nBits), sim_thresh_(sim_thresh),
         stat_1d_(stat_1d), stat_2d_(stat_2d), stat_3d_(stat_3d),
         alpha_(alpha), num_threads_(num_threads), counting_method_(counting_method),
-        k_threshold_(2), use_key_loo_(use_key_loo), verbose_(verbose), is_fitted_(false) {}  // Fix initialization order
+        k_threshold_(k_threshold), use_key_loo_(use_key_loo), verbose_(verbose), is_fitted_(false) { margin_mode_ = margin_mode; }
     
     // Build prevalence for all tasks
     void fit(
@@ -4501,24 +4533,26 @@ public:
             }
             int n_negative = n_measured - n_positive;
             
-            cout << "  Measured samples: " << n_measured << " (" 
-                 << (100.0*n_measured/n_molecules) << "%)\n";
-            cout << "  Positive: " << n_positive << " (" 
-                 << (100.0*n_positive/n_measured) << "%)\n";
-            cout << "  Negative: " << n_negative << " (" 
-                 << (100.0*n_negative/n_measured) << "%)\n";
-            
             if (n_measured == 0) {
                 throw runtime_error("Task " + to_string(task_idx) + " has no measured samples!");
             }
-            
+
+            if (verbose_) {
+                cout << "  Measured samples: " << n_measured << " ("
+                     << (100.0*n_measured/n_molecules) << "%)\n";
+                cout << "  Positive: " << n_positive << " ("
+                     << (100.0*n_positive/n_measured) << "%)\n";
+                cout << "  Negative: " << n_negative << " ("
+                     << (100.0*n_negative/n_measured) << "%)\n";
+            }
+
             // Build prevalence using existing C++ code
-            cout << "  Building 1D prevalence...\n";
+            if (verbose_) cout << "  Building 1D prevalence...\n";
             auto prev_1d = task_generators_[task_idx].build_1d_ftp_stats_threaded(
                 smiles_task, labels_task, radius_, stat_1d_, alpha_, num_threads_
             );
             
-            cout << "  Building 2D prevalence...\n";
+            if (verbose_) cout << "  Building 2D prevalence...\n";
             // Build pairs for 2D
             // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
             auto pairs = task_generators_[task_idx].make_pairs_balanced_cpp(
@@ -4528,7 +4562,7 @@ public:
                 smiles_task, labels_task, pairs, radius_, prev_1d, stat_2d_, alpha_
             );
             
-            cout << "  Building 3D prevalence...\n";
+            if (verbose_) cout << "  Building 3D prevalence...\n";
             // Build triplets for 3D
             // NOTE: Use radius=2 for similarity calculation (matching Python), but radius_ for prevalence
             auto triplets = task_generators_[task_idx].make_triplets_cpp(
@@ -4574,7 +4608,7 @@ public:
             
             // Key-LOO: Count keys on measured molecules only (ONLY if use_key_loo_ is true!)
             if (use_key_loo_) {
-                cout << "  Counting keys for Key-LOO filtering...\n";
+                if (verbose_) cout << "  Counting keys for Key-LOO filtering...\n";
                 auto all_keys = task_generators_[task_idx].get_all_motif_keys_batch_threaded(
                     smiles_task, radius_, num_threads_
                 );
@@ -4597,25 +4631,27 @@ public:
                 key_total_count_per_task_[task_idx] = key_tot_count;
                 n_measured_per_task_[task_idx] = n_measured;
             } else {
-                cout << "  Skipping Key-LOO filtering (Dummy-Masking mode)...\n";
+                if (verbose_) cout << "  Skipping Key-LOO filtering (Dummy-Masking mode)...\n";
                 // For Dummy-Masking: No Key-LOO, so leave counts empty
                 key_molecule_count_per_task_[task_idx] = {};
                 key_total_count_per_task_[task_idx] = {};
                 n_measured_per_task_[task_idx] = 0;  // Not used in Dummy-Masking
             }
             
-            cout << "  ✅ Prevalence built for " << task_names[task_idx] << "\n";
+            if (verbose_) cout << "  ✅ Prevalence built for " << task_names[task_idx] << "\n";
         }
         
         is_fitted_ = true;
         
-        cout << "\n" << string(80, '=') << "\n";
-        cout << "✅ ALL TASK PREVALENCE BUILT (C++)!\n";
-        cout << string(80, '=') << "\n";
-        cout << "Total tasks: " << n_tasks_ << "\n";
-        cout << "Features per task: " << get_features_per_task() << " (1D + 2D + 3D)\n";
-        cout << "Total features: " << (n_tasks_ * get_features_per_task()) << "\n";
-        cout << string(80, '=') << "\n";
+        if (verbose_) {
+            cout << "\n" << string(80, '=') << "\n";
+            cout << "✅ ALL TASK PREVALENCE BUILT (C++)!\n";
+            cout << string(80, '=') << "\n";
+            cout << "Total tasks: " << n_tasks_ << "\n";
+            cout << "Features per task: " << get_features_per_task() << " (1D + 2D + 3D)\n";
+            cout << "Total features: " << (n_tasks_ * get_features_per_task()) << "\n";
+            cout << string(80, '=') << "\n";
+        }
     }
     
     // Wrapper for Python: accepts optional train_row_mask as Python list/array
@@ -4675,16 +4711,18 @@ public:
             }
         }
         // If train_row_mask is nullptr or all false, this is inference → no rescaling
-        
-        cout << "\n" << string(80, '=') << "\n";
-        cout << "TRANSFORMING TO MULTI-TASK FEATURES (C++)\n";
-        cout << string(80, '=') << "\n";
-        cout << "Molecules: " << n_molecules << "\n";
-        cout << "Total features: " << n_features_total << "\n";
-        if (use_key_loo_) {
-            cout << "Key-LOO rescaling: " << (apply_key_loo_rescaling ? "YES (training)" : "NO (inference)") << "\n";
+
+        if (verbose_) {
+            cout << "\n" << string(80, '=') << "\n";
+            cout << "TRANSFORMING TO MULTI-TASK FEATURES (C++)\n";
+            cout << string(80, '=') << "\n";
+            cout << "Molecules: " << n_molecules << "\n";
+            cout << "Total features: " << n_features_total << "\n";
+            if (use_key_loo_) {
+                cout << "Key-LOO rescaling: " << (apply_key_loo_rescaling ? "YES (training)" : "NO (inference)") << "\n";
+            }
         }
-        
+
         // Allocate output array
         py::array_t<double> result({n_molecules, n_features_total});
         auto buf = result.request();
@@ -4692,12 +4730,18 @@ public:
         
         // Transform each task
         for (int task_idx = 0; task_idx < n_tasks_; task_idx++) {
-            cout << "  Task " << (task_idx+1) << "/" << n_tasks_ 
-                 << " (" << task_names_[task_idx] << ")... " << flush;
-            
+            if (verbose_) {
+                cout << "  Task " << (task_idx+1) << "/" << n_tasks_
+                     << " (" << task_names_[task_idx] << ")... " << flush;
+            }
+
+            // Propagate the margin mode to this task's generator so build_3view_vectors_batch
+            // emits signcount / magnitude / both consistently with get_features_per_task().
+            task_generators_[task_idx].set_margin_mode(margin_mode_);
+
             // Choose transform method based on use_key_loo_ flag
             std::tuple<vector<vector<double>>, vector<vector<double>>, vector<vector<double>>> result_tuple;
-            
+
             if (use_key_loo_) {
                 // Key-LOO: Filter keys based on occurrence counts
                 // FIXED: Only apply rescaling for training molecules, never at inference
@@ -4764,15 +4808,17 @@ public:
                 }
             }
             
-            cout << "✅ (" << features_per_task << " features)\n";
+            if (verbose_) cout << "✅ (" << features_per_task << " features)\n";
         }
-        
-        cout << "\n✅ Multi-task features created (C++):\n";
-        cout << "   Shape: (" << n_molecules << ", " << n_features_total << ")\n";
-        cout << "   Features per task: " << features_per_task << "\n";
-        cout << "   Total features: " << n_features_total << "\n";
-        cout << string(80, '=') << "\n";
-        
+
+        if (verbose_) {
+            cout << "\n✅ Multi-task features created (C++):\n";
+            cout << "   Shape: (" << n_molecules << ", " << n_features_total << ")\n";
+            cout << "   Features per task: " << features_per_task << "\n";
+            cout << "   Total features: " << n_features_total << "\n";
+            cout << string(80, '=') << "\n";
+        }
+
         return result;
     }
     
@@ -4899,16 +4945,17 @@ public:
             k_threshold_,
             use_key_loo_,
             verbose_,
-            is_fitted_
+            is_fitted_,
+            margin_mode_
         );
     }
     
     // Pickle support: __setstate__
     void __setstate__(py::tuple t) {
-        if (t.size() != 21) {
+        if (t.size() != 21 && t.size() != 22) {
             throw std::runtime_error("Invalid state for MultiTaskPrevalenceGenerator!");
         }
-        
+
         n_tasks_ = t[0].cast<int>();
         radius_ = t[1].cast<int>();
         nBits_ = t[2].cast<int>();
@@ -4930,7 +4977,8 @@ public:
         use_key_loo_ = t[18].cast<bool>();
         verbose_ = t[19].cast<bool>();
         is_fitted_ = t[20].cast<bool>();
-        
+        margin_mode_ = (t.size() >= 22) ? t[21].cast<int>() : 0;  // back-compat: old states -> signcount
+
         // Reconstruct task_generators_ (they don't need to store state, just need to exist)
         task_generators_.clear();
         task_generators_.resize(n_tasks_, VectorizedFTPGenerator(nBits_, sim_thresh_, 1000, 1000, counting_method_));
@@ -5066,7 +5114,7 @@ PYBIND11_MODULE(_molftp, m) {
     
     // Multi-Task Prevalence Generator bindings
     py::class_<MultiTaskPrevalenceGenerator>(m, "MultiTaskPrevalenceGenerator")
-        .def(py::init<int, int, double, string, string, string, double, int, CountingMethod, bool, bool>(),
+        .def(py::init<int, int, double, string, string, string, double, int, CountingMethod, int, bool, bool, int>(),
              py::arg("radius") = 6,
              py::arg("nBits") = 2048,
              py::arg("sim_thresh") = 0.5,
@@ -5076,13 +5124,17 @@ PYBIND11_MODULE(_molftp, m) {
              py::arg("alpha") = 0.5,
              py::arg("num_threads") = 0,
              py::arg("counting_method") = CountingMethod::COUNTING,
+             py::arg("k_threshold") = 2,  // Key-LOO filter: keep keys whose molecule- AND total-count >= k_threshold
              py::arg("use_key_loo") = true,  // NEW: Enable/disable Key-LOO (true=Key-LOO, false=Dummy-Masking)
              py::arg("verbose") = false,  // NEW: Enable/disable verbose output
+             py::arg("margin_mode") = 0,  // 0=signcount (default), 1=magnitude (paper eq.5), 2=both
              "Initialize Multi-Task Prevalence Generator\n"
              "use_key_loo=True: Key-LOO filtering (for Key-LOO multi-task)\n"
              "use_key_loo=False: Simple prevalence, no filtering (for Dummy-Masking)\n"
              "verbose=True: Print progress messages\n"
-             "verbose=False: Silent mode (for performance)")
+             "verbose=False: Silent mode (for performance)\n"
+             "margin_mode: 0=signcount net-count margin (default), 1=magnitude max(+)-min(-)\n"
+             "  (paper eq.5), 2=both (concatenate signcount+magnitude, +2 features per view)")
         .def("fit", &MultiTaskPrevalenceGenerator::fit,
              py::arg("smiles"), py::arg("Y_sparse"), py::arg("task_names"),
              "Build task-specific prevalence for all tasks (Y_sparse: 2D NumPy array with NaN)")
@@ -5105,6 +5157,16 @@ PYBIND11_MODULE(_molftp, m) {
              "Get number of tasks")
         .def("is_fitted", &MultiTaskPrevalenceGenerator::is_fitted,
              "Check if model is fitted")
-        .def("__getstate__", &MultiTaskPrevalenceGenerator::__getstate__)
-        .def("__setstate__", &MultiTaskPrevalenceGenerator::__setstate__);
+        // Proper pybind11 pickle protocol. The previous separate .def("__getstate__")/
+        // .def("__setstate__") did NOT restore state through pickle.dumps/loads (the
+        // unpickled object came back unfitted), which also broke save_features/load_features.
+        // py::pickle's second callable is a FACTORY that constructs a fresh instance and
+        // applies the saved state — the form pybind11 actually invokes during unpickling.
+        .def(py::pickle(
+            [](const MultiTaskPrevalenceGenerator& g) { return g.__getstate__(); },
+            [](py::tuple t) {
+                MultiTaskPrevalenceGenerator g;
+                g.__setstate__(t);
+                return g;
+            }));
 }

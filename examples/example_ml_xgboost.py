@@ -85,7 +85,7 @@ print("✅ XGBoost model trained successfully")
 print("\n" + "=" * 70)
 print("Step 5: Evaluating on Test Set")
 print("=" * 70)
-X_test = gen.transform(test_smiles, train_indices_per_task=[train_indices])
+X_test = gen.transform(test_smiles)  # out-of-sample inference: frozen fitted prevalence (unseen keys masked to 0)
 y_pred = model.predict(X_test)
 y_proba = model.predict_proba(X_test)[:, 1]
 
@@ -107,7 +107,7 @@ gen_loaded = MultiTaskPrevalenceGenerator.load_features('dummymask_features.pkl'
 new_smiles = ["CCCCCCCC", "c1ccc(O)cc1"]  # Octane, Phenol
 new_smiles_names = ["Octane", "Phenol"]
 
-X_new = gen_loaded.transform(new_smiles, train_indices_per_task=[train_indices])
+X_new = gen_loaded.transform(new_smiles)  # out-of-sample inference (no batch-relative train indices)
 y_new_pred = model.predict(X_new)
 y_new_proba = model.predict_proba(X_new)[:, 1]
 

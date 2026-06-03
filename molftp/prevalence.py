@@ -631,8 +631,9 @@ class MultiTaskPrevalenceGenerator:
                  num_threads: int = -1,
                  counting_method: str = 'counting',
                  k_threshold: int = 2,
-                 loo_smoothing_tau: float = 1.0):
-        
+                 loo_smoothing_tau: float = 1.0,
+                 margin_mode: str = 'signcount'):
+
         self.radius = radius
         self.method = method
         self.stat_1d = stat_1d
@@ -660,16 +661,39 @@ class MultiTaskPrevalenceGenerator:
         self.counting_method = counting_map[self.counting_method_name]
         self.k_threshold = k_threshold
         self.loo_smoothing_tau = loo_smoothing_tau
-        
+
+        # Margin aggregation mode for the V[0]/V[1] features (see docs/api.md + research-notes.md):
+        #   'signcount' (default, back-compat): net (pos - neg) atom count
+        #   'magnitude' (paper eq.5): max(positive) - min(negative) atom-localized score
+        #   'both': concatenate signcount + magnitude (adds 2 features per view)
+        margin_map = {'signcount': 0, 'magnitude': 1, 'both': 2}
+        if margin_mode not in margin_map:
+            raise ValueError(f"Invalid margin_mode: {margin_mode}. Must be one of {list(margin_map)}")
+        self.margin_mode = margin_mode
+        self._margin_mode_int = margin_map[margin_mode]
+
+
         # Determine use_key_loo flag based on method
         if method not in ['key_loo', 'dummy_masking']:
             raise ValueError(f"Invalid method: {method}. Must be 'key_loo' or 'dummy_masking'")
         
         use_key_loo = (method == 'key_loo')
         
-        # Initialize C++ multi-task generator
-        # Note: k_threshold and loo_smoothing_tau are stored in Python but NOT passed to C++
-        # C++ uses default k_threshold=2 internally
+        # Initialize C++ multi-task generator.
+        # k_threshold is passed through to the C++ core, where it filters out keys whose
+        # per-molecule AND total occurrence counts are < k_threshold (see the parameter
+        # docstring). loo_smoothing_tau is retained on the Python object (for save/load and
+        # API stability) but is NOT yet applied by the C++ core; setting it to a non-default
+        # value emits a warning rather than silently doing nothing.
+        if not float(self.loo_smoothing_tau) == 1.0:
+            warnings.warn(
+                "loo_smoothing_tau != 1.0 has no effect on the features: molFTP's 3-view features "
+                "are sign-based counts, so the (k_j-1+tau)/(k_j+tau) magnitude rescale (a positive "
+                "scalar) cannot change them, and it is not wired into the C++ core anyway. Use "
+                "k_threshold for rare-key / leakage control. The value is stored for "
+                "forward-compatibility only.",
+                RuntimeWarning, stacklevel=2,
+            )
         self.generator = ftp.MultiTaskPrevalenceGenerator(
             radius=self.radius,
             nBits=self.nBits,
@@ -680,8 +704,10 @@ class MultiTaskPrevalenceGenerator:
             alpha=self.alpha,
             num_threads=self.num_threads if self.num_threads > 0 else 0,  # C++ uses 0 for auto
             counting_method=self.counting_method,
+            k_threshold=self.k_threshold,
             use_key_loo=use_key_loo,
-            verbose=False  # Disable verbose by default
+            verbose=False,  # Disable verbose by default
+            margin_mode=self._margin_mode_int,
         )
         
         # State tracking
@@ -841,15 +867,32 @@ class MultiTaskPrevalenceGenerator:
                 return self.generator.transform(smiles)
         
         elif self.method == 'dummy_masking':
-            # Dummy-Masking: Requires train indices for masking
+            # Out-of-sample INFERENCE: no train_indices_per_task -> use the frozen
+            # fitted prevalence. Keys never seen in training are simply absent from the
+            # prevalence maps and therefore contribute 0 (i.e. they are masked) — that
+            # IS dummy-masking at inference, with no batch-relative indices required.
+            #
+            # The train_indices path below indexes INTO `smiles` and only makes sense
+            # for IN-SAMPLE CV masking (batch == the fitted set). Using it on a held-out
+            # batch re-derives the "train keys" from the wrong rows — silently collapsing
+            # the features (and indexing out of bounds for a smaller/new batch). That was
+            # the inference-collapse bug.
             if train_indices_per_task is None:
-                raise ValueError("Dummy-Masking requires train_indices_per_task. "
-                               "Provide a list of training indices for each task.")
-            
+                return self.generator.transform(smiles)
+
             if len(train_indices_per_task) != self.n_tasks_:
                 raise ValueError(f"train_indices_per_task must have {self.n_tasks_} elements (one per task), "
                                f"got {len(train_indices_per_task)}")
-            
+            # These indices address rows of THIS `smiles` batch (not the fitted set).
+            # Fail loudly on out-of-range indices instead of collapsing silently.
+            n = len(smiles)
+            for t_idx, ti in enumerate(train_indices_per_task):
+                if len(ti) and (min(ti) < 0 or max(ti) >= n):
+                    raise ValueError(
+                        f"train_indices_per_task[{t_idx}] references rows outside the transform "
+                        f"batch (n={n}). dummy_masking train indices address `smiles` rows, not the "
+                        f"training set. For out-of-sample inference call transform(smiles) WITHOUT "
+                        f"train_indices_per_task.")
             return self.generator.transform_with_dummy_masking(smiles, train_indices_per_task)
         
         else:
@@ -926,6 +969,7 @@ class MultiTaskPrevalenceGenerator:
             'counting_method_name': self.counting_method_name,
             'k_threshold': self.k_threshold,  # NEW: Include k_threshold in saved state
             'loo_smoothing_tau': self.loo_smoothing_tau,  # NEW: Include loo_smoothing_tau in saved state
+            'margin_mode': self.margin_mode,  # signcount / magnitude / both
         }
         
         try:
@@ -987,6 +1031,7 @@ class MultiTaskPrevalenceGenerator:
             counting_method=state.get('counting_method_name', 'counting'),
             k_threshold=state.get('k_threshold', 2),  # NEW: Restore k_threshold (default=2 filters singletons)
             loo_smoothing_tau=state.get('loo_smoothing_tau', 1.0),  # NEW: Restore loo_smoothing_tau (default=1.0 for backward compatibility)
+            margin_mode=state.get('margin_mode', 'signcount'),  # back-compat: old saves -> signcount
         )
         
         # Restore C++ generator and fitted state

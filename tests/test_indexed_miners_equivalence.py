@@ -21,18 +21,37 @@ except ImportError:
     pytest.skip("molftp not available", allow_module_level=True)
 
 def make_synthetic(n=200, pos_ratio=0.3, seed=0):
-    """Create synthetic SMILES dataset with deterministic labels."""
-    # Simple, valid chains: "CCC...", deterministic
-    smiles = ["C" * k for k in range(3, 3 + n)]
+    """Create a synthetic dataset of chemically DISTINCT molecules with deterministic labels.
+
+    NOTE: this intentionally does NOT use linear alkanes ("C"*k). At radius 6 those saturate
+    to identical Morgan fingerprints, so most molecules are Tanimoto-1.0 ties. Greedy PASS-FAIL
+    matching on tied candidates is order-dependent: the parallel indexed path and the sequential
+    legacy path -- each deterministic and individually a valid maximum-similarity matching --
+    need not produce bit-identical matchings on such degenerate input. With distinct molecules
+    the nearest FAIL is unambiguous, so the two paths must (and do) agree exactly. That exact
+    agreement on realistic, distinct inputs is the property this test is meant to verify.
+    """
+    cores = ['c1ccccc1', 'C1CCCCC1', 'c1ccncc1', 'c1ccsc1', 'C1CCNCC1', 'c1cccnc1', 'C1CCOCC1', 'c1ccoc1']
+    links = ['', 'C', 'CC', 'CCC', 'O', 'N', 'CO', 'CN', 'S', 'CCO']
+    tails = ['C', 'O', 'N', 'F', 'Cl', 'Br', 'C(F)(F)F', 'C#N', 'C(=O)O', 'CO']
+    pool = []
+    for c in cores:
+        for l in links:
+            for t in tails:
+                s = c + l + t
+                if s not in pool:
+                    pool.append(s)
+    assert len(pool) >= n, f"distinct-molecule pool has {len(pool)}, need {n}"
+    smiles = pool[:n]
     labels = np.array([1 if (i / n) < pos_ratio else 0 for i in range(n)], dtype=int)
-    
+
     # Shuffle deterministically so PASS/FAIL are mixed
     rng = random.Random(seed)
     order = list(range(n))
     rng.shuffle(order)
     smiles = [smiles[i] for i in order]
     labels = labels[order]
-    
+
     return smiles, labels
 
 def run_fit_transform(force_legacy=False, seed=42):

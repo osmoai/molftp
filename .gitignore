@@ -32,6 +32,7 @@ htmlcov/
 # Build artifacts
 lib/
 temp.*/
+*.log
 
-# PR documentation (not included in PR)
-PR_SPEEDUP_*.md
+# Local build env scratch
+validate_fix.py

@@ -1,0 +1,31 @@
+# MolFTP build + runtime environment (conda-forge).
+#
+# conda-forge's `rdkit` ships the C++ headers ($PREFIX/include/rdkit) and libraries
+# ($PREFIX/lib) that MolFTP's C++ core compiles and links against, and pulls in Boost.
+# The plain `pip install rdkit` wheel is runtime-only (no headers) and CANNOT build it.
+#
+#   conda env create -f environment.yml     # or: mamba env create -f environment.yml
+#   conda activate molftp
+#   pip install -e .
+#
+name: molftp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - rdkit=2026.03          # RDKit Python runtime (latest)
+  # The two -dev packages below are what make this build work. conda-forge SPLITS RDKit:
+  # `rdkit` is runtime-only; the C++ headers live in `librdkit-dev`, and RDKit's headers
+  # transitively #include <boost/...>, which `libboost-devel` provides. Omitting either is
+  # the usual cause of "RDKit C++ headers not found" / "boost/... file not found".
+  - librdkit-dev=2026.03   # RDKit C++ headers + dev symlinks
+  - libboost-devel         # Boost headers (pulled in by RDKit's headers)
+  - pybind11>=2.10
+  - cxx-compiler           # clang/gcc toolchain (C++20-capable), pinned by conda-forge
+  - numpy>=1.19
+  - pandas>=1.3
+  - scikit-learn>=1.0
+  - pytest>=7.0            # test suite
+  - pip
+  # Optional, for the gradient-boosting examples/benchmarks:
+  - xgboost

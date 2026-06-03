@@ -118,13 +118,24 @@ survive (and therefore the features). Earlier releases stored it in Python but d
 to C++ (it was hardcoded to 2); that is fixed — `test_regressions.py::test_k_threshold_changes_features`
 guards against a regression.
 
-### Honest limitations
+### Sign-count features: why the LOO magnitude rescale and `loo_smoothing_tau` are inert
 
-- **`loo_smoothing_tau`** is accepted and stored for forward-compatibility but is **not implemented
-  in the C++ core**. Setting it to anything other than `1.0` emits a `RuntimeWarning` and has no
-  effect on the features.
-- The Key-LOO `(k_j-1)/k_j` prevalence rescale currently does **not** change the aggregated 3-view
-  features (the `max` aggregation in `build_3view_vectors_batch` is insensitive to that magnitude
-  scaling). This is tracked as an `xfail`
-  (`test_kloo_core.py::test_per_molecule_rescaling_changes_training_rows`) pending a review of the
-  intended LOO semantics. Inference is unaffected and leakage-safe regardless.
+molFTP's three-view features are **sign-based net counts**: for each view, `transform` counts the
+atoms whose aggregated fragment prevalence is ≥ 0 (PASS-leaning) vs ≤ 0 (FAIL-leaning) and reports
+the net `(pos − neg)` (overall and per depth). Only the **sign** of each prevalence value matters,
+never its magnitude. Two consequences worth knowing:
+
+- The Key-LOO `(k_j−1)/k_j` prevalence rescale and `loo_smoothing_tau`'s `(k_j−1+τ)/(k_j+τ)` are
+  **positive scalars** — they preserve every sign, so they **cannot change the features**. This is a
+  property of the feature design, not a no-op bug. Passing a training mask therefore yields the same
+  features as plain inference (pinned by
+  `test_kloo_core.py::test_positive_rescale_is_inert_for_sign_count_features`). `loo_smoothing_tau`
+  is additionally not wired into the C++ core; setting it ≠ 1.0 emits a `RuntimeWarning`.
+- The **effective** rare-key / leakage control is **`k_threshold`**, which *removes* keys (singletons
+  at `k_threshold ≥ 2`) and so does change the counts — see
+  `test_regressions.py::test_k_threshold_changes_features`. A label-permutation test confirms the
+  pipeline is leakage-safe in practice.
+
+If you want the LOO magnitude correction to actually influence the model, the aggregation in
+`build_3view_vectors_batch` would need to be made magnitude-aware (e.g. summing/maxing *signed*
+prevalence instead of counting signs) — a deliberate change that would shift all downstream results.

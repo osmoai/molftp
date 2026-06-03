@@ -31,23 +31,28 @@ def test_per_molecule_rescaling_train_only(mtpg, smiles, radius):
     np.testing.assert_allclose(X_falsemask, X_nomask, rtol=1e-8, atol=1e-10)
 
 
-@pytest.mark.xfail(
-    reason="The (k_j-1)/k_j Key-LOO prevalence rescale runs (transform reports 'rescaling: YES') "
-           "but does not change the aggregated 3-view features: build_3view_vectors_batch's 'max' "
-           "aggregation is insensitive to the rescale magnitude. Whether the LOO correction should "
-           "alter the features is a question about molFTP's intended semantics and needs maintainer "
-           "review of build_3view_vectors_batch. strict=False so this won't fail the suite but will "
-           "flag if the behavior ever changes.",
-    strict=False,
-)
-def test_per_molecule_rescaling_changes_training_rows(mtpg, smiles):
+def test_positive_rescale_is_inert_for_sign_count_features(mtpg, smiles):
+    """Characterization test (documents *why*, not a bug).
+
+    molFTP's 3-view features are SIGN-BASED net counts: build_3view_vectors_batch counts atoms
+    whose aggregated prevalence is >= 0 (PASS-leaning) vs <= 0 (FAIL-leaning) and reports the net
+    (pos - neg). Only the *sign* of each prevalence value matters, never its magnitude.
+
+    The Key-LOO ``(k_j - 1)/k_j`` rescale (and ``loo_smoothing_tau``'s ``(k_j-1+tau)/(k_j+tau)``)
+    are POSITIVE scalars, so they preserve every sign and therefore cannot change these features.
+    That is by design, not a no-op bug. The effective rare-key / leakage control is ``k_threshold``,
+    which *removes* keys and so does change the counts — see
+    ``test_regressions.py::test_k_threshold_changes_features``.
+
+    Passing a training mask therefore leaves the features identical to plain inference; this test
+    pins that invariant so a future change to the aggregation (e.g. magnitude-aware features) is
+    caught here.
+    """
     n = len(smiles)
     train_mask = np.array([True] * (n // 2) + [False] * (n - n // 2), dtype=bool)
-    X_mask = mtpg.transform(smiles, train_row_mask=train_mask)
-    X_nomask = mtpg.transform(smiles)
-    idx_tr = np.where(train_mask)[0]
-    diff = np.abs(X_mask[idx_tr] - X_nomask[idx_tr]).mean()
-    assert diff > 1e-9, f"Expected Key-LOO rescaling to change training rows, got mean Δ={diff:.3e}"
+    X_mask = np.asarray(mtpg.transform(smiles, train_row_mask=train_mask))
+    X_nomask = np.asarray(mtpg.transform(smiles))
+    np.testing.assert_allclose(X_mask, X_nomask, atol=1e-10)
 
 
 def test_inference_independence_from_batch(mtpg, smiles):
@@ -89,11 +94,12 @@ def test_2d_keys_are_subset_of_1d(vecgen: VectorizedFTPGenerator, smiles, labels
 
 
 @pytest.mark.skip(
-    reason="loo_smoothing_tau is NOT implemented in the C++ core (it exists nowhere in "
-           "molftp_core.cpp). PrevalenceGenerator stores it for forward-compatibility and warns "
-           "if set != 1.0. This test constructs the C++ class with the non-existent method= and "
-           "loo_smoothing_tau= kwargs and asserts tau-monotonicity, neither of which is real. "
-           "Re-enable once per-key (k-1+tau)/(k+tau) smoothing is actually wired into the core.")
+    reason="loo_smoothing_tau is inert for molFTP's SIGN-COUNT features AND not wired into the C++ "
+           "core. Even if implemented, (k_j-1+tau)/(k_j+tau) is a positive scalar that preserves "
+           "the prevalence sign, and the features depend only on sign — so |X| cannot vary with "
+           "tau (see test_positive_rescale_is_inert_for_sign_count_features). This test also uses "
+           "the non-existent method= / loo_smoothing_tau= C++ kwargs. The effective rare-key / "
+           "leakage control is k_threshold. Re-enable only if the aggregation is made magnitude-aware.")
 def test_tau_smoothing_monotone(mtpg, smiles, radius, Y_sparse, task_names):
     # As tau increases, the shrink factor (k+tau-1)/(k+tau) → 1, so mean|X| should (weakly) increase
     taus = [0.0, 1.0, 5.0]

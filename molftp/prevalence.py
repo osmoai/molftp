@@ -675,8 +675,11 @@ class MultiTaskPrevalenceGenerator:
         # value emits a warning rather than silently doing nothing.
         if not float(self.loo_smoothing_tau) == 1.0:
             warnings.warn(
-                "loo_smoothing_tau != 1.0 is not yet implemented in the C++ core and has no "
-                "effect on the computed features. It is stored for forward-compatibility only.",
+                "loo_smoothing_tau != 1.0 has no effect on the features: molFTP's 3-view features "
+                "are sign-based counts, so the (k_j-1+tau)/(k_j+tau) magnitude rescale (a positive "
+                "scalar) cannot change them, and it is not wired into the C++ core anyway. Use "
+                "k_threshold for rare-key / leakage control. The value is stored for "
+                "forward-compatibility only.",
                 RuntimeWarning, stacklevel=2,
             )
         self.generator = ftp.MultiTaskPrevalenceGenerator(
